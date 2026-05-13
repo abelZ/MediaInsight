@@ -1,6 +1,6 @@
 """Background parse worker thread."""
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Signal, QElapsedTimer
 from typing import List, Optional
 
 from media_analyzer.core.models import PacketInfo, StreamInfo
@@ -9,8 +9,10 @@ from media_analyzer.parsers.base import BaseParser
 from media_analyzer.parsers.flv.parser import FLVParser
 
 
-# Batch size for emitting packets to UI
-BATCH_SIZE = 500
+# Emit packets to UI in batches for efficiency
+BATCH_SIZE = 1000
+# Minimum interval between UI updates (ms) to avoid overwhelming the event loop
+MIN_EMIT_INTERVAL_MS = 50
 
 
 class ParseWorker(QThread):
@@ -18,8 +20,10 @@ class ParseWorker(QThread):
     Parses a media file in a background thread.
     Emits batches of PacketInfo to the UI thread via signals.
 
-    Thread-safety: only emits signals (which Qt marshals to the UI thread).
-    The source is owned by this thread once started.
+    Performance optimizations:
+    - Batches packets (up to BATCH_SIZE) before emitting
+    - Throttles signal emission to at most once per MIN_EMIT_INTERVAL_MS
+    - Yields control back periodically to keep the thread responsive to stop()
     """
 
     # Signals
@@ -56,6 +60,9 @@ class ParseWorker(QThread):
 
             batch: List[PacketInfo] = []
             total_size = self._source.size
+            timer = QElapsedTimer()
+            timer.start()
+            last_emit_time = 0
 
             for packet in self._parser.parse_incremental(reader):
                 if not self._running:
@@ -63,11 +70,14 @@ class ParseWorker(QThread):
 
                 batch.append(packet)
 
-                if len(batch) >= BATCH_SIZE:
+                # Emit when batch is full OR enough time has passed
+                elapsed = timer.elapsed()
+                if len(batch) >= BATCH_SIZE or (elapsed - last_emit_time >= MIN_EMIT_INTERVAL_MS and batch):
                     self.packets_ready.emit(batch.copy())
                     batch.clear()
+                    last_emit_time = elapsed
 
-                    # Emit progress periodically
+                    # Emit progress (not every packet, only on batch emit)
                     if total_size > 0:
                         self.progress.emit(
                             packet.offset + packet.data_size,

@@ -134,6 +134,7 @@ class NALUInfo:
     offset_in_tag: int       # Byte offset relative to tag data start
     header_bytes: bytes      # First few bytes of the NALU header (for display)
     is_vcl: bool = False     # True if this is a VCL (video coding layer) NALU
+    parsed_fields: Optional[Dict[str, Any]] = None  # Parsed bitstream fields (SPS/PPS/VPS)
 
 
 @dataclass(slots=True)
@@ -214,10 +215,30 @@ class PacketInfo:
 
     @property
     def frame_label(self) -> str:
-        """Human-readable frame type."""
-        if self.frame_type is not None:
+        """Human-readable frame type: I/P/B/etc."""
+        if self.frame_type is None:
+            return ""
+
+        if self.frame_type == FrameType.KEY:
+            # Keyframe = IDR = I-frame
+            return "I"
+        elif self.frame_type == FrameType.INTER:
+            # Distinguish P vs B using composition_time (CTS)
+            # B-frames have CTS != 0 (PTS differs from DTS)
+            # P-frames have CTS == 0 (PTS == DTS)
+            if self.composition_time is not None and self.composition_time != 0:
+                return "B"
+            else:
+                return "P"
+        elif self.frame_type == FrameType.DISPOSABLE_INTER:
+            # Disposable inter frame (can be dropped) — typically B
+            return "B (disposable)"
+        elif self.frame_type == FrameType.GENERATED_KEY:
+            return "I (generated)"
+        elif self.frame_type == FrameType.VIDEO_INFO:
+            return "Info"
+        else:
             return self.frame_type.name
-        return ""
 
     @property
     def detail_label(self) -> str:

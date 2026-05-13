@@ -10,7 +10,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from typing import Optional
 
 from media_analyzer.core.models import PacketInfo, StreamInfo, TagType, NALUInfo
-from media_analyzer.core.source import FileSource, HTTPStreamSource
+from media_analyzer.core.source import FileSource, StreamingHTTPSource
 from media_analyzer.ui.packet_table.model import PacketTableModel
 from media_analyzer.ui.packet_table.view import PacketTableView
 from media_analyzer.ui.hex_view import HexViewWidget
@@ -35,6 +35,7 @@ class MainWindow(QMainWindow):
 
         self._worker: Optional[ParseWorker] = None
         self._stream_info: Optional[StreamInfo] = None
+        self._current_packet: Optional[PacketInfo] = None
 
         self._setup_models()
         self._setup_ui()
@@ -174,6 +175,22 @@ class MainWindow(QMainWindow):
 
         filter_menu.addSeparator()
 
+        self._filter_idr_action = QAction("IDR Frames Only", self)
+        self._filter_idr_action.setCheckable(True)
+        self._filter_idr_action.setChecked(False)
+        self._filter_idr_action.setShortcut(QKeySequence("Ctrl+4"))
+        self._filter_idr_action.toggled.connect(self._apply_filters)
+        filter_menu.addAction(self._filter_idr_action)
+
+        self._filter_sei_action = QAction("Has SEI Only", self)
+        self._filter_sei_action.setCheckable(True)
+        self._filter_sei_action.setChecked(False)
+        self._filter_sei_action.setShortcut(QKeySequence("Ctrl+5"))
+        self._filter_sei_action.toggled.connect(self._apply_filters)
+        filter_menu.addAction(self._filter_sei_action)
+
+        filter_menu.addSeparator()
+
         show_all_action = QAction("Show All", self)
         show_all_action.setShortcut(QKeySequence("Ctrl+0"))
         show_all_action.triggered.connect(self._show_all_filters)
@@ -221,6 +238,7 @@ class MainWindow(QMainWindow):
         """Connect internal signals."""
         self._table_view.packet_selected.connect(self._on_packet_selected)
         self._detail_panel.nalu_selected.connect(self._on_nalu_selected)
+        self._detail_panel.field_byte_range.connect(self._on_field_byte_range)
 
     # --- Actions ---
 
@@ -245,7 +263,7 @@ class MainWindow(QMainWindow):
             text="http://"
         )
         if ok and url and url != "http://":
-            source = HTTPStreamSource(url)
+            source = StreamingHTTPSource(url)
             self._start_parsing(source)
 
     def _stop_parsing(self):
@@ -263,6 +281,8 @@ class MainWindow(QMainWindow):
             show_video=self._filter_video_action.isChecked(),
             show_audio=self._filter_audio_action.isChecked(),
             show_script=self._filter_script_action.isChecked(),
+            only_idr=self._filter_idr_action.isChecked(),
+            only_has_sei=self._filter_sei_action.isChecked(),
         )
         # Update status with filter info
         count = self._table_model.packet_count
@@ -278,6 +298,8 @@ class MainWindow(QMainWindow):
         self._filter_video_action.setChecked(True)
         self._filter_audio_action.setChecked(True)
         self._filter_script_action.setChecked(True)
+        self._filter_idr_action.setChecked(False)
+        self._filter_sei_action.setChecked(False)
 
     # --- Parsing ---
 
@@ -312,12 +334,9 @@ class MainWindow(QMainWindow):
         """Handle batch of parsed packets from worker."""
         self._table_model.append_packets(packets)
 
+        # Update status (lightweight — just show count)
         count = self._table_model.packet_count
-        visible = self._table_view.proxy_model.rowCount()
-        if visible < count:
-            self._status_label.setText(f"{visible:,} / {count:,} tags (filtered)")
-        else:
-            self._status_label.setText(f"{count:,} tags loaded")
+        self._status_label.setText(f"{count:,} tags loaded")
 
     def _on_progress(self, current: int, total: int):
         """Update progress bar."""
@@ -367,18 +386,69 @@ class MainWindow(QMainWindow):
 
     def _on_packet_selected(self, packet: PacketInfo):
         """Handle packet row selection - update detail and hex panels."""
+        self._current_packet = packet
+
         # Update detail panel
         self._detail_panel.show_packet(packet)
 
         # Load hex data for this tag
+        self._show_tag_hex(packet)
+
+    def _on_nalu_selected(self, nalu: NALUInfo, packet: PacketInfo):
+        """Handle NALU item click in detail panel - show NALU bytes in hex view."""
         if self._worker and self._worker.source:
             try:
-                # Read the tag header + some data (up to 4KB)
+                # NALU absolute offset in file:
+                #   packet.offset = tag start (including 11-byte tag header)
+                #   +11 = skip tag header
+                #   +nalu.offset_in_tag = offset within tag data to the length prefix
+                # The offset_in_tag already includes the 5-byte AVC header (frametype+codec+avcpkttype+cts)
+                # and points to the length prefix of this NALU
+                abs_offset = packet.offset + 11 + nalu.offset_in_tag
+                # Read: 4-byte length prefix + NALU data
+                read_size = min(4 + nalu.size, 4096)
+                raw = self._worker.source.read_range(abs_offset, read_size)
+                self._hex_view.set_data(raw, abs_offset)
+            except Exception:
+                self._hex_view.clear()
+
+    def _show_tag_hex(self, packet: PacketInfo):
+        """Load full tag bytes into the hex view."""
+        if self._worker and self._worker.source:
+            try:
                 read_size = min(packet.tag_total_size, 4096)
                 raw = self._worker.source.read_range(packet.offset, read_size)
                 self._hex_view.set_data(raw, packet.offset)
+                self._hex_view.clear_highlight()
             except Exception:
                 self._hex_view.clear()
+
+    def _on_field_byte_range(self, offset: int, length: int):
+        """Handle detail field click — highlight corresponding bytes in hex view."""
+        if self._current_packet is None:
+            return
+
+        # Determine how the offset relates to the currently displayed hex data.
+        #
+        # Two cases:
+        # 1. Hex shows full tag: field offsets are relative to tag start.
+        #    hex_base == packet.offset, so highlight_offset = offset directly.
+        #
+        # 2. Hex shows NALU data: NALU sub-field offsets are relative to NALU start
+        #    (i.e. relative to the displayed data). Use offset directly.
+        #
+        # Strategy: try to use offset directly. If it fits within the displayed
+        # data, highlight it. Otherwise reload the full tag and use offset as-is.
+
+        data_len = len(self._hex_view._data)
+
+        if 0 <= offset < data_len:
+            # Offset fits within current hex data — highlight directly
+            self._hex_view.highlight_range(offset, length)
+        else:
+            # Outside current view — reload full tag, then highlight
+            self._show_tag_hex(self._current_packet)
+            self._hex_view.highlight_range(offset, length)
 
     # --- Cleanup ---
 

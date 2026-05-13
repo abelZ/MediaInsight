@@ -11,6 +11,8 @@ from media_analyzer.core.models import (
     NALUInfo, H264NALUType, H265NALUType,
 )
 from media_analyzer.parsers.flv.script import AMF0Decoder
+from media_analyzer.parsers.h264.sps import parse_sps
+from media_analyzer.parsers.h264.pps import parse_pps
 
 
 class FLVParseError(Exception):
@@ -333,6 +335,14 @@ class FLVParser(BaseParser):
                 header_bytes=header_bytes,
                 is_vcl=is_vcl,
             )
+
+            # Parse SPS/PPS bitstream fields
+            nalu_data = data[pos:pos + nalu_len]
+            if nalu_type_val == H264NALUType.SPS and nalu_len > 4:
+                nalu_info.parsed_fields = parse_sps(nalu_data)
+            elif nalu_type_val == H264NALUType.PPS and nalu_len > 2:
+                nalu_info.parsed_fields = parse_pps(nalu_data)
+
             nalus.append(nalu_info)
 
             pos += nalu_len
@@ -442,7 +452,7 @@ class FLVParser(BaseParser):
             nalu_type_val = nalu_header & 0x1F
             header_bytes = data[pos:pos + min(4, sps_len)]
 
-            nalus.append(NALUInfo(
+            sps_nalu = NALUInfo(
                 index=idx,
                 nalu_type=nalu_type_val,
                 nalu_type_name="SPS",
@@ -450,7 +460,11 @@ class FLVParser(BaseParser):
                 offset_in_tag=base_offset + pos - 2,
                 header_bytes=header_bytes,
                 is_vcl=False,
-            ))
+            )
+            # Parse SPS bitstream fields
+            if sps_len > 4:
+                sps_nalu.parsed_fields = parse_sps(data[pos:pos + sps_len])
+            nalus.append(sps_nalu)
             pos += sps_len
             idx += 1
 
@@ -471,7 +485,7 @@ class FLVParser(BaseParser):
                 nalu_type_val = nalu_header & 0x1F
                 header_bytes = data[pos:pos + min(4, pps_len)]
 
-                nalus.append(NALUInfo(
+                pps_nalu = NALUInfo(
                     index=idx,
                     nalu_type=nalu_type_val,
                     nalu_type_name="PPS",
@@ -479,7 +493,11 @@ class FLVParser(BaseParser):
                     offset_in_tag=base_offset + pos - 2,
                     header_bytes=header_bytes,
                     is_vcl=False,
-                ))
+                )
+                # Parse PPS bitstream fields
+                if pps_len > 2:
+                    pps_nalu.parsed_fields = parse_pps(data[pos:pos + pps_len])
+                nalus.append(pps_nalu)
                 pos += pps_len
                 idx += 1
 

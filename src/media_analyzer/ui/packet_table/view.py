@@ -3,14 +3,18 @@
 from PySide6.QtWidgets import QTableView, QHeaderView, QAbstractItemView
 from PySide6.QtCore import Qt, Signal, QModelIndex, QSortFilterProxyModel
 
-from media_analyzer.core.models import PacketInfo, TagType
+from media_analyzer.core.models import PacketInfo, TagType, FrameType, H264NALUType
 from media_analyzer.ui.packet_table.model import PacketTableModel, COLUMNS
 
 
 class PacketFilterProxyModel(QSortFilterProxyModel):
     """
-    Filter proxy that shows/hides rows based on tag type.
+    Filter proxy that shows/hides rows based on tag type and frame properties.
     Header rows always pass through. Video/Audio/Script can be toggled.
+    Additional filters: IDR-only, has-SEI-only (these narrow video results).
+
+    Performance: when all filters are OFF (common case during loading),
+    filterAcceptsRow returns True immediately without any lookup.
     """
 
     def __init__(self, parent=None):
@@ -19,22 +23,39 @@ class PacketFilterProxyModel(QSortFilterProxyModel):
         self._show_video = True
         self._show_audio = True
         self._show_script = True
+        # Narrowing filters (only affect video tags)
+        self._only_idr = False       # When True, only show IDR (I-frame) video tags
+        self._only_has_sei = False   # When True, only show video tags containing SEI NALUs
+        self._all_visible = True     # Fast path flag
 
-    def set_filter(self, show_video: bool, show_audio: bool, show_script: bool) -> None:
+    def set_filter(self, show_video: bool, show_audio: bool, show_script: bool,
+                   only_idr: bool = False, only_has_sei: bool = False) -> None:
         """Update which tag types are visible."""
         changed = (
             self._show_video != show_video or
             self._show_audio != show_audio or
-            self._show_script != show_script
+            self._show_script != show_script or
+            self._only_idr != only_idr or
+            self._only_has_sei != only_has_sei
         )
         self._show_video = show_video
         self._show_audio = show_audio
         self._show_script = show_script
+        self._only_idr = only_idr
+        self._only_has_sei = only_has_sei
+        self._all_visible = (
+            show_video and show_audio and show_script
+            and not only_idr and not only_has_sei
+        )
         if changed:
             self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         """Decide if a row passes the filter."""
+        # Fast path: all visible, no narrowing filters
+        if self._all_visible:
+            return True
+
         source_model = self.sourceModel()
         if not isinstance(source_model, PacketTableModel):
             return True
@@ -48,13 +69,33 @@ class PacketFilterProxyModel(QSortFilterProxyModel):
         if tag_type == TagType.HEADER:
             return self._show_header
         elif tag_type == TagType.VIDEO:
-            return self._show_video
+            if not self._show_video:
+                return False
+            # Apply narrowing filters for video
+            if self._only_idr:
+                if packet.frame_type != FrameType.KEY:
+                    return False
+            if self._only_has_sei:
+                if not self._packet_has_sei(packet):
+                    return False
+            return True
         elif tag_type == TagType.AUDIO:
             return self._show_audio
         elif tag_type == TagType.SCRIPT:
             return self._show_script
 
         return True
+
+    @staticmethod
+    def _packet_has_sei(packet: PacketInfo) -> bool:
+        """Check if a video packet contains a SEI NALU."""
+        if not packet.nalu_list:
+            return False
+        for nalu in packet.nalu_list:
+            # H.264 SEI = type 6, H.265 PREFIX_SEI = 39, SUFFIX_SEI = 40
+            if nalu.nalu_type in (6, 39, 40):
+                return True
+        return False
 
     def get_packet(self, proxy_row: int):
         """Get the PacketInfo for a proxy row (maps back to source)."""

@@ -7,10 +7,11 @@ Split into two synchronized panels:
 
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPlainTextEdit, QLabel, QSplitter,
+    QTextEdit,
 )
 from PySide6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter,
-    QTextDocument, QFontDatabase, QTextOption,
+    QTextDocument, QFontDatabase, QTextOption, QTextCursor,
 )
 from PySide6.QtCore import Qt
 
@@ -266,6 +267,9 @@ class HexViewWidget(QWidget):
 
         self._hex_edit.setPlainText("\n".join(hex_lines))
         self._ascii_edit.setPlainText("\n".join(ascii_lines))
+        # Clear any previous highlights
+        self._hex_edit.setExtraSelections([])
+        self._ascii_edit.setExtraSelections([])
 
     def clear(self) -> None:
         """Clear the hex view."""
@@ -273,3 +277,85 @@ class HexViewWidget(QWidget):
         self._hex_edit.setPlainText("")
         self._ascii_edit.setPlainText("")
         self._title.setText("Hex View")
+
+    def highlight_range(self, byte_offset: int, byte_length: int) -> None:
+        """
+        Highlight a range of bytes in both hex and ascii panels.
+
+        byte_offset: offset relative to self._base_offset (i.e. relative to
+                     the start of self._data, which is the tag start)
+        byte_length: number of bytes to highlight
+        """
+        if not self._data or byte_length <= 0:
+            self._hex_edit.setExtraSelections([])
+            self._ascii_edit.setExtraSelections([])
+            return
+
+        # Highlight format
+        hl_fmt = QTextCharFormat()
+        hl_fmt.setBackground(QColor(80, 60, 20))      # Warm dark gold
+        hl_fmt.setForeground(QColor(255, 220, 100))    # Bright yellow text
+
+        hex_selections = []
+        ascii_selections = []
+
+        hex_doc = self._hex_edit.document()
+        ascii_doc = self._ascii_edit.document()
+
+        for byte_idx in range(byte_offset, min(byte_offset + byte_length, len(self._data))):
+            row = byte_idx // self.BYTES_PER_ROW
+            col = byte_idx % self.BYTES_PER_ROW
+
+            # --- Hex panel ---
+            # Line index: row+1 (row 0 is header)
+            hex_block = hex_doc.findBlockByLineNumber(row + 1)
+            if hex_block.isValid():
+                # Column position within the line:
+                # "XXXXXXXX  XX XX XX XX XX XX XX XX  XX XX XX XX XX XX XX XX"
+                #  0       8 10                                             56
+                # Each byte = 2 hex chars + 1 space = 3 chars
+                # First group (0-7): starts at pos 10, each byte at 10 + col*3
+                # Second group (8-15): starts at 10 + 8*3 + 2 = 36, at 36 + (col-8)*3
+                if col < 8:
+                    char_pos = 10 + col * 3
+                else:
+                    char_pos = 10 + 8 * 3 + 2 + (col - 8) * 3
+
+                cursor = QTextCursor(hex_block)
+                cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                    QTextCursor.MoveMode.MoveAnchor, char_pos)
+                cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                    QTextCursor.MoveMode.KeepAnchor, 2)
+
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor = cursor
+                sel.format = hl_fmt
+                hex_selections.append(sel)
+
+            # --- ASCII panel ---
+            # Line index: row+1 (row 0 is "Decoded text" header)
+            ascii_block = ascii_doc.findBlockByLineNumber(row + 1)
+            if ascii_block.isValid() and col < ascii_block.length():
+                cursor = QTextCursor(ascii_block)
+                cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                    QTextCursor.MoveMode.MoveAnchor, col)
+                cursor.movePosition(QTextCursor.MoveOperation.Right,
+                                    QTextCursor.MoveMode.KeepAnchor, 1)
+
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor = cursor
+                sel.format = hl_fmt
+                ascii_selections.append(sel)
+
+        self._hex_edit.setExtraSelections(hex_selections)
+        self._ascii_edit.setExtraSelections(ascii_selections)
+
+        # Scroll to make the first highlighted byte visible
+        if hex_selections:
+            self._hex_edit.setTextCursor(hex_selections[0].cursor)
+            self._hex_edit.ensureCursorVisible()
+
+    def clear_highlight(self) -> None:
+        """Remove all byte highlights."""
+        self._hex_edit.setExtraSelections([])
+        self._ascii_edit.setExtraSelections([])
