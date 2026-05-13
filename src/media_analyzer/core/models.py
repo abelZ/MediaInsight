@@ -53,10 +53,40 @@ class AudioCodec(IntEnum):
 
 
 class AVCPacketType(IntEnum):
-    """AVC/HEVC packet types."""
+    """AVC/HEVC/AV1 packet types (traditional FLV extension)."""
     SEQUENCE_HEADER = 0
     NALU = 1
     END_OF_SEQUENCE = 2
+
+
+class EnhancedPacketType(IntEnum):
+    """Enhanced RTMP packet types."""
+    SEQUENCE_START = 0
+    CODED_FRAMES = 1
+    SEQUENCE_END = 2
+    CODED_FRAMES_X = 3    # Keyframe without CTS offset
+    METADATA = 4
+    MPEG2TS_SEQUENCE_START = 5
+
+
+class AV1OBUType(IntEnum):
+    """AV1 Open Bitstream Unit types."""
+    SEQUENCE_HEADER = 1
+    TEMPORAL_DELIMITER = 2
+    FRAME_HEADER = 3
+    TILE_GROUP = 4
+    METADATA = 5
+    FRAME = 6
+    REDUNDANT_FRAME_HEADER = 7
+    TILE_LIST = 8
+    PADDING = 15
+
+
+# FourCC codec identifiers for Enhanced RTMP
+FOURCC_HEVC = b'hvc1'
+FOURCC_AV1 = b'av01'
+FOURCC_VP9 = b'vp09'
+FOURCC_AVC = b'avc1'
 
 
 class AACPacketType(IntEnum):
@@ -163,6 +193,8 @@ class PacketInfo:
     video_codec: Optional[VideoCodec] = None
     avc_packet_type: Optional[AVCPacketType] = None
     composition_time: Optional[int] = None   # CTS offset (SI24)
+    is_enhanced_rtmp: bool = False            # True if Enhanced RTMP format
+    fourcc: Optional[bytes] = None           # FourCC codec ID for Enhanced RTMP
 
     # Audio-specific (None for non-audio)
     audio_codec: Optional[AudioCodec] = None

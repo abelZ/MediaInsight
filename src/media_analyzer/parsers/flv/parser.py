@@ -7,12 +7,16 @@ from media_analyzer.parsers.base import BaseParser
 from media_analyzer.core.models import (
     PacketInfo, StreamInfo, FLVHeader, FLVHeaderInfo,
     TagType, FrameType, VideoCodec, AudioCodec,
-    AVCPacketType, AACPacketType,
-    NALUInfo, H264NALUType, H265NALUType,
+    AVCPacketType, AACPacketType, EnhancedPacketType,
+    NALUInfo, H264NALUType, H265NALUType, AV1OBUType,
+    FOURCC_HEVC, FOURCC_AV1, FOURCC_VP9, FOURCC_AVC,
 )
 from media_analyzer.parsers.flv.script import AMF0Decoder
 from media_analyzer.parsers.h264.sps import parse_sps
 from media_analyzer.parsers.h264.pps import parse_pps
+from media_analyzer.parsers.h265.vps import parse_hevc_vps
+from media_analyzer.parsers.h265.sps import parse_hevc_sps
+from media_analyzer.parsers.h265.pps import parse_hevc_pps
 
 
 class FLVParseError(Exception):
@@ -223,13 +227,30 @@ class FLVParser(BaseParser):
 
     def _parse_video_tag(self, packet: PacketInfo, data: bytes) -> None:
         """
-        Parse video tag data.
+        Parse video tag data. Supports both traditional FLV and Enhanced RTMP.
 
-        First byte: FrameType (upper 4 bits) | CodecID (lower 4 bits)
-        For AVC (CodecID=7):
+        Traditional format:
+          Byte 0: FrameType (upper 4 bits) | CodecID (lower 4 bits)
           Byte 1: AVCPacketType (0=seq header, 1=NALU, 2=end)
-          Bytes 2-4: CompositionTime (SI24, signed 24-bit big-endian)
+          Bytes 2-4: CompositionTime (SI24)
+
+        Enhanced RTMP (IsExHeader=1, bit 7 of byte 0 set):
+          Byte 0: [1 | PacketType(4b) | 0(3b)] — when high bit set
+          Actually: byte0 & 0x80 → enhanced mode
+          Byte 0: high nibble has 0b1000 (IsExHeader), low nibble = PacketType
+          Bytes 1-4: FourCC codec identifier ('hvc1', 'av01', etc.)
+          Bytes 5+: Payload (for CodedFrames: CTS(3) + NALUs)
         """
+        first_byte = data[0]
+        is_ex_header = (first_byte & 0x80) != 0
+
+        if is_ex_header:
+            self._parse_video_tag_enhanced(packet, data)
+        else:
+            self._parse_video_tag_traditional(packet, data)
+
+    def _parse_video_tag_traditional(self, packet: PacketInfo, data: bytes) -> None:
+        """Parse traditional FLV video tag (CodecID in lower 4 bits)."""
         first_byte = data[0]
         frame_type_val = (first_byte >> 4) & 0x0F
         codec_id_val = first_byte & 0x0F
@@ -246,7 +267,7 @@ class FLVParser(BaseParser):
         except ValueError:
             packet.video_codec = None
 
-        # AVC/HEVC specific fields
+        # AVC/HEVC/AV1 specific fields
         if codec_id_val in (VideoCodec.AVC, 12, 13) and len(data) >= 5:
             try:
                 packet.avc_packet_type = AVCPacketType(data[1])
@@ -256,25 +277,107 @@ class FLVParser(BaseParser):
             # CompositionTime is SI24 (signed 24-bit big-endian)
             ct_bytes = data[2:5]
             ct = struct.unpack(">I", b"\x00" + ct_bytes)[0]
-            # Sign extension for 24-bit signed integer
             if ct >= 0x800000:
                 ct -= 0x1000000
             packet.composition_time = ct
 
-            # Parse NALUs from the payload
-            nalu_payload = data[5:]  # After FrameType+CodecID(1) + AVCPacketType(1) + CTS(3)
+            # Parse NALUs/OBUs from the payload
+            nalu_payload = data[5:]
             if packet.avc_packet_type == AVCPacketType.SEQUENCE_HEADER:
-                # AVC: parse AVCDecoderConfigurationRecord for SPS/PPS
                 if codec_id_val == VideoCodec.AVC:
                     packet.nalu_list = self._parse_avc_decoder_config(nalu_payload, 5)
                 elif codec_id_val == 12:  # HEVC
                     packet.nalu_list = self._parse_hevc_decoder_config(nalu_payload, 5)
+                elif codec_id_val == 13:  # AV1
+                    packet.nalu_list = self._parse_av1_config(nalu_payload, 5)
             elif packet.avc_packet_type == AVCPacketType.NALU:
-                # Parse length-prefixed NALUs
                 if codec_id_val == VideoCodec.AVC:
                     packet.nalu_list = self._parse_avc_nalus(nalu_payload, 5)
                 elif codec_id_val == 12:  # HEVC
                     packet.nalu_list = self._parse_hevc_nalus(nalu_payload, 5)
+                elif codec_id_val == 13:  # AV1
+                    packet.nalu_list = self._parse_av1_obus(nalu_payload, 5)
+
+    def _parse_video_tag_enhanced(self, packet: PacketInfo, data: bytes) -> None:
+        """
+        Parse Enhanced RTMP video tag.
+
+        Byte 0: [1(IsExHeader) | FrameType(3b) | PacketType(4b)]
+        Bytes 1-4: FourCC codec identifier
+        Bytes 5+: Payload
+        """
+        if len(data) < 5:
+            return
+
+        first_byte = data[0]
+        packet.is_enhanced_rtmp = True
+
+        # Frame type from bits 4-6 (3 bits after IsExHeader bit)
+        frame_type_val = (first_byte >> 4) & 0x07
+        # Map enhanced frame types: 1=key, 2=inter, 3=disposable, 4=generated_key
+        try:
+            packet.frame_type = FrameType(frame_type_val) if frame_type_val > 0 else None
+        except ValueError:
+            packet.frame_type = None
+
+        # Packet type from lower 4 bits
+        pkt_type = first_byte & 0x0F
+
+        # FourCC codec identifier
+        fourcc = data[1:5]
+        packet.fourcc = fourcc
+
+        # Map FourCC to VideoCodec enum
+        if fourcc == FOURCC_HEVC:
+            packet.video_codec = VideoCodec.HEVC
+        elif fourcc == FOURCC_AV1:
+            packet.video_codec = VideoCodec.AV1
+        elif fourcc == FOURCC_AVC:
+            packet.video_codec = VideoCodec.AVC
+        else:
+            # VP9 or unknown
+            pass
+
+        # Map enhanced packet type to AVCPacketType for unified handling
+        if pkt_type == EnhancedPacketType.SEQUENCE_START:
+            packet.avc_packet_type = AVCPacketType.SEQUENCE_HEADER
+        elif pkt_type in (EnhancedPacketType.CODED_FRAMES,
+                          EnhancedPacketType.CODED_FRAMES_X):
+            packet.avc_packet_type = AVCPacketType.NALU
+        elif pkt_type == EnhancedPacketType.SEQUENCE_END:
+            packet.avc_packet_type = AVCPacketType.END_OF_SEQUENCE
+
+        # Payload starts at byte 5
+        payload = data[5:]
+        payload_offset = 5  # offset within tag data
+
+        # For CODED_FRAMES (type 1), first 3 bytes are CTS
+        if pkt_type == EnhancedPacketType.CODED_FRAMES and len(payload) >= 3:
+            ct = struct.unpack(">I", b"\x00" + payload[:3])[0]
+            if ct >= 0x800000:
+                ct -= 0x1000000
+            packet.composition_time = ct
+            payload = payload[3:]
+            payload_offset += 3
+        elif pkt_type == EnhancedPacketType.CODED_FRAMES_X:
+            packet.composition_time = 0
+
+        # Parse based on codec + packet type
+        if pkt_type == EnhancedPacketType.SEQUENCE_START:
+            if fourcc == FOURCC_HEVC:
+                packet.nalu_list = self._parse_hevc_decoder_config(payload, payload_offset)
+            elif fourcc == FOURCC_AV1:
+                packet.nalu_list = self._parse_av1_config(payload, payload_offset)
+            elif fourcc == FOURCC_AVC:
+                packet.nalu_list = self._parse_avc_decoder_config(payload, payload_offset)
+        elif pkt_type in (EnhancedPacketType.CODED_FRAMES,
+                          EnhancedPacketType.CODED_FRAMES_X):
+            if fourcc == FOURCC_HEVC:
+                packet.nalu_list = self._parse_hevc_nalus(payload, payload_offset)
+            elif fourcc == FOURCC_AV1:
+                packet.nalu_list = self._parse_av1_obus(payload, payload_offset)
+            elif fourcc == FOURCC_AVC:
+                packet.nalu_list = self._parse_avc_nalus(payload, payload_offset)
 
     def _parse_avc_nalus(self, data: bytes, base_offset: int,
                           length_size: int = 4) -> list:
@@ -403,6 +506,16 @@ class FLVParser(BaseParser):
                 header_bytes=header_bytes,
                 is_vcl=is_vcl,
             )
+
+            # Parse HEVC VPS/SPS/PPS bitstream fields
+            nalu_data = data[pos:pos + nalu_len]
+            if nalu_type_val == H265NALUType.VPS and nalu_len > 4:
+                nalu_info.parsed_fields = parse_hevc_vps(nalu_data)
+            elif nalu_type_val == H265NALUType.SPS and nalu_len > 4:
+                nalu_info.parsed_fields = parse_hevc_sps(nalu_data)
+            elif nalu_type_val == H265NALUType.PPS and nalu_len > 3:
+                nalu_info.parsed_fields = parse_hevc_pps(nalu_data)
+
             nalus.append(nalu_info)
 
             pos += nalu_len
@@ -554,7 +667,7 @@ class FLVParser(BaseParser):
 
                 header_bytes = data[pos:pos + min(4, nalu_len)]
 
-                nalus.append(NALUInfo(
+                hevc_nalu = NALUInfo(
                     index=idx,
                     nalu_type=nalu_type_val,
                     nalu_type_name=type_name,
@@ -562,11 +675,322 @@ class FLVParser(BaseParser):
                     offset_in_tag=base_offset + pos - 2,
                     header_bytes=header_bytes,
                     is_vcl=False,
-                ))
+                )
+                # Parse HEVC VPS/SPS/PPS bitstream fields
+                nalu_data = data[pos:pos + nalu_len]
+                if nalu_type_val == H265NALUType.VPS and nalu_len > 4:
+                    hevc_nalu.parsed_fields = parse_hevc_vps(nalu_data)
+                elif nalu_type_val == H265NALUType.SPS and nalu_len > 4:
+                    hevc_nalu.parsed_fields = parse_hevc_sps(nalu_data)
+                elif nalu_type_val == H265NALUType.PPS and nalu_len > 3:
+                    hevc_nalu.parsed_fields = parse_hevc_pps(nalu_data)
+
+                nalus.append(hevc_nalu)
                 pos += nalu_len
                 idx += 1
 
         return nalus if nalus else None
+
+        return nalus if nalus else None
+
+    def _parse_av1_config(self, data: bytes, base_offset: int) -> list:
+        """
+        Parse AV1CodecConfigurationRecord.
+
+        Structure (4 bytes fixed header + configOBUs):
+          Byte 0: marker(1) | version(7)
+          Byte 1: seq_profile(3) | seq_level_idx_0(5)
+          Byte 2: seq_tier_0(1) | high_bitdepth(1) | twelve_bit(1) | monochrome(1)
+                   | chroma_subsampling_x(1) | chroma_subsampling_y(1)
+                   | chroma_sample_position(2)
+          Byte 3: reserved(3) | initial_presentation_delay_present(1)
+                   | initial_presentation_delay_minus_one(4) or reserved(4)
+          Bytes 4+: configOBUs[] (sequence header OBU etc.)
+        """
+        nalus = []
+        if len(data) < 4:
+            return None
+
+        # Parse the 4-byte config header as a "config" NALUInfo
+        marker = (data[0] >> 7) & 0x01
+        version = data[0] & 0x7F
+        seq_profile = (data[1] >> 5) & 0x07
+        seq_level_idx = data[1] & 0x1F
+        seq_tier = (data[2] >> 7) & 0x01
+        high_bitdepth = (data[2] >> 6) & 0x01
+        twelve_bit = (data[2] >> 5) & 0x01
+        monochrome = (data[2] >> 4) & 0x01
+        chroma_sub_x = (data[2] >> 3) & 0x01
+        chroma_sub_y = (data[2] >> 2) & 0x01
+        chroma_sample_pos = data[2] & 0x03
+
+        # Compute bit depth
+        if high_bitdepth and twelve_bit:
+            bit_depth = 12
+        elif high_bitdepth:
+            bit_depth = 10
+        else:
+            bit_depth = 8
+
+        # Chroma format
+        if monochrome:
+            chroma = "Monochrome"
+        elif chroma_sub_x and chroma_sub_y:
+            chroma = "4:2:0"
+        elif chroma_sub_x:
+            chroma = "4:2:2"
+        else:
+            chroma = "4:4:4"
+
+        profile_names = {0: "Main", 1: "High", 2: "Professional"}
+
+        config_fields = [
+            ("version", version),
+            ("seq_profile", f"{seq_profile} ({profile_names.get(seq_profile, 'Unknown')})"),
+            ("seq_level_idx", seq_level_idx),
+            ("seq_tier", "High" if seq_tier else "Main"),
+            ("bit_depth", bit_depth),
+            ("monochrome", bool(monochrome)),
+            ("chroma_format", chroma),
+            ("chroma_sample_position", chroma_sample_pos),
+        ]
+
+        config_nalu = NALUInfo(
+            index=0,
+            nalu_type=0,
+            nalu_type_name="AV1Config",
+            size=len(data),
+            offset_in_tag=base_offset,
+            header_bytes=data[:4],
+            is_vcl=False,
+            parsed_fields=config_fields,
+        )
+        nalus.append(config_nalu)
+
+        # Parse configOBUs (typically contains sequence header OBU)
+        if len(data) > 4:
+            obu_list = self._parse_av1_obus(data[4:], base_offset + 4)
+            if obu_list:
+                for obu in obu_list:
+                    obu.index = len(nalus)
+                    nalus.append(obu)
+
+        return nalus if nalus else None
+
+    def _parse_av1_obus(self, data: bytes, base_offset: int) -> list:
+        """
+        Parse AV1 OBU (Open Bitstream Unit) stream.
+
+        OBU Header (1-2 bytes):
+          obu_forbidden_bit (1) | obu_type (4) | obu_extension_flag (1)
+          | obu_has_size_field (1) | obu_reserved_1bit (1)
+        If obu_has_size_field: followed by leb128-encoded size
+        """
+        nalus = []
+        pos = 0
+        idx = 0
+
+        while pos < len(data):
+            if pos >= len(data):
+                break
+
+            obu_start = pos
+            header_byte = data[pos]
+            pos += 1
+
+            obu_type = (header_byte >> 3) & 0x0F
+            extension_flag = (header_byte >> 2) & 0x01
+            has_size_field = (header_byte >> 1) & 0x01
+
+            if extension_flag:
+                if pos >= len(data):
+                    break
+                pos += 1  # Skip extension byte
+
+            # Read OBU size (leb128)
+            obu_size = 0
+            if has_size_field:
+                obu_size, bytes_read = self._read_leb128(data, pos)
+                pos += bytes_read
+            else:
+                # No size field — rest of data is this OBU
+                obu_size = len(data) - pos
+
+            if pos + obu_size > len(data):
+                obu_size = len(data) - pos
+
+            # Get OBU type name
+            try:
+                obu_type_enum = AV1OBUType(obu_type)
+                obu_type_name = obu_type_enum.name
+            except ValueError:
+                obu_type_name = f"UNKNOWN({obu_type})"
+
+            header_bytes = data[obu_start:obu_start + min(4, pos - obu_start + obu_size)]
+
+            nalu_info = NALUInfo(
+                index=idx,
+                nalu_type=obu_type,
+                nalu_type_name=f"OBU_{obu_type_name}",
+                size=obu_size,
+                offset_in_tag=base_offset + obu_start,
+                header_bytes=header_bytes,
+                is_vcl=(obu_type in (3, 4, 6)),  # Frame header, tile group, frame
+            )
+
+            # Parse sequence header OBU
+            if obu_type == AV1OBUType.SEQUENCE_HEADER and obu_size > 2:
+                nalu_info.parsed_fields = self._parse_av1_sequence_header(
+                    data[pos:pos + obu_size])
+
+            nalus.append(nalu_info)
+            pos += obu_size
+            idx += 1
+
+        return nalus if nalus else None
+
+    @staticmethod
+    def _read_leb128(data: bytes, pos: int) -> tuple:
+        """Read a leb128-encoded unsigned integer. Returns (value, bytes_consumed)."""
+        value = 0
+        bytes_read = 0
+        for i in range(8):  # Max 8 bytes
+            if pos + i >= len(data):
+                break
+            byte = data[pos + i]
+            value |= (byte & 0x7F) << (i * 7)
+            bytes_read += 1
+            if (byte & 0x80) == 0:
+                break
+        return value, bytes_read
+
+    @staticmethod
+    def _parse_av1_sequence_header(data: bytes) -> list:
+        """
+        Parse AV1 Sequence Header OBU basic fields.
+        Extracts profile, level, dimensions, bit depth, color info.
+        """
+        from media_analyzer.parsers.h264.bitreader import BitReader
+
+        try:
+            reader = BitReader(data)
+            fields = []
+
+            # seq_profile: u(3)
+            seq_profile = reader.read_bits(3)
+            profile_names = {0: "Main", 1: "High", 2: "Professional"}
+            fields.append(("seq_profile",
+                          f"{seq_profile} ({profile_names.get(seq_profile, 'Unknown')})"))
+
+            # still_picture: u(1)
+            fields.append(("still_picture", reader.read_bool()))
+
+            # reduced_still_picture_header: u(1)
+            reduced_header = reader.read_bool()
+            fields.append(("reduced_still_picture_header", reduced_header))
+
+            if reduced_header:
+                # seq_level_idx[0]: u(5)
+                fields.append(("seq_level_idx", reader.read_bits(5)))
+            else:
+                # timing_info_present_flag
+                timing_present = reader.read_bool()
+                if timing_present:
+                    num_units = reader.read_bits(32)
+                    time_scale = reader.read_bits(32)
+                    equal_picture_interval = reader.read_bool()
+                    t_children = [
+                        ("num_units_in_display_tick", num_units),
+                        ("time_scale", time_scale),
+                        ("equal_picture_interval", equal_picture_interval),
+                    ]
+                    if equal_picture_interval:
+                        t_children.append(("num_ticks_per_picture", reader.read_ue() + 1))
+                    if num_units > 0:
+                        t_children.append(("framerate", f"{time_scale / num_units:.4f}"))
+                    fields.append(("timing_info", True, t_children))
+
+                # initial_display_delay_present_flag
+                reader.read_bool()
+
+                # operating_points
+                operating_points_cnt = reader.read_bits(5) + 1
+                for i in range(operating_points_cnt):
+                    reader.read_bits(12)  # operating_point_idc
+                    level_idx = reader.read_bits(5)
+                    if i == 0:
+                        fields.append(("seq_level_idx", level_idx))
+                    if level_idx > 7:
+                        reader.read_bits(1)  # seq_tier
+
+            # frame_width_bits_minus_1: u(4)
+            frame_width_bits = reader.read_bits(4) + 1
+            # frame_height_bits_minus_1: u(4)
+            frame_height_bits = reader.read_bits(4) + 1
+
+            # max_frame_width_minus_1: u(n)
+            max_width = reader.read_bits(frame_width_bits) + 1
+            # max_frame_height_minus_1: u(n)
+            max_height = reader.read_bits(frame_height_bits) + 1
+
+            fields.append(("max_frame_width", max_width))
+            fields.append(("max_frame_height", max_height))
+
+            # frame_id_numbers_present_flag (if not reduced_header)
+            if not reduced_header:
+                frame_id_present = reader.read_bool()
+                if frame_id_present:
+                    reader.read_bits(4)  # delta_frame_id_length
+                    reader.read_bits(3)  # additional_frame_id_length
+
+            # use_128x128_superblock
+            fields.append(("use_128x128_superblock", reader.read_bool()))
+
+            # enable_filter_intra, enable_intra_edge_filter
+            fields.append(("enable_filter_intra", reader.read_bool()))
+            fields.append(("enable_intra_edge_filter", reader.read_bool()))
+
+            # Additional enable flags (if not reduced_header)
+            if not reduced_header:
+                fields.append(("enable_interintra_compound", reader.read_bool()))
+                fields.append(("enable_masked_compound", reader.read_bool()))
+                fields.append(("enable_warped_motion", reader.read_bool()))
+                fields.append(("enable_dual_filter", reader.read_bool()))
+                enable_order_hint = reader.read_bool()
+                fields.append(("enable_order_hint", enable_order_hint))
+                if enable_order_hint:
+                    fields.append(("enable_jnt_comp", reader.read_bool()))
+                    fields.append(("enable_ref_frame_mvs", reader.read_bool()))
+
+                # seq_choose_screen_content_tools
+                seq_force_screen = reader.read_bool()
+                if not seq_force_screen:
+                    reader.read_bits(1)  # seq_force_screen_content_tools
+
+                # seq_choose_integer_mv
+                seq_force_int_mv = reader.read_bool()
+                if not seq_force_int_mv:
+                    reader.read_bits(1)
+
+                if enable_order_hint:
+                    fields.append(("order_hint_bits", reader.read_bits(3) + 1))
+
+            # enable_superres, enable_cdef, enable_restoration
+            fields.append(("enable_superres", reader.read_bool()))
+            fields.append(("enable_cdef", reader.read_bool()))
+            fields.append(("enable_restoration", reader.read_bool()))
+
+            # color_config
+            color_children = _parse_av1_color_config(reader, seq_profile)
+            fields.append(("color_config", True, color_children))
+
+            # film_grain_params_present
+            fields.append(("film_grain_params_present", reader.read_bool()))
+
+            return fields
+
+        except (EOFError, ValueError, IndexError):
+            return fields if fields else None
 
     def _parse_audio_tag(self, packet: PacketInfo, data: bytes) -> None:
         """
@@ -663,3 +1087,61 @@ class FLVParser(BaseParser):
                 )
 
         return info
+
+
+def _parse_av1_color_config(reader, seq_profile) -> list:
+    """Parse AV1 color_config fields (module-level helper)."""
+    fields = []
+    try:
+        high_bitdepth = reader.read_bool()
+        if seq_profile == 2 and high_bitdepth:
+            twelve_bit = reader.read_bool()
+            bit_depth = 12 if twelve_bit else 10
+        elif seq_profile <= 2:
+            bit_depth = 10 if high_bitdepth else 8
+        else:
+            bit_depth = 8
+
+        fields.append(("bit_depth", bit_depth))
+
+        if seq_profile == 1:
+            mono_chrome = False
+        else:
+            mono_chrome = reader.read_bool()
+        fields.append(("mono_chrome", mono_chrome))
+
+        color_desc_present = reader.read_bool()
+        if color_desc_present:
+            fields.append(("color_primaries", reader.read_bits(8)))
+            fields.append(("transfer_characteristics", reader.read_bits(8)))
+            fields.append(("matrix_coefficients", reader.read_bits(8)))
+
+        if mono_chrome:
+            fields.append(("color_range", reader.read_bool()))
+        else:
+            color_range = reader.read_bool()
+            fields.append(("color_range", color_range))
+            if seq_profile in (0, 1):
+                subsampling_x = 1
+                subsampling_y = 1
+            elif bit_depth == 12:
+                subsampling_x = reader.read_bits(1)
+                if subsampling_x:
+                    subsampling_y = reader.read_bits(1)
+                else:
+                    subsampling_y = 0
+            else:
+                subsampling_x = 1
+                subsampling_y = 0
+
+            if subsampling_x and subsampling_y:
+                fields.append(("chroma_format", "4:2:0"))
+                fields.append(("chroma_sample_position", reader.read_bits(2)))
+            elif subsampling_x:
+                fields.append(("chroma_format", "4:2:2"))
+            else:
+                fields.append(("chroma_format", "4:4:4"))
+
+    except (EOFError, ValueError):
+        pass
+    return fields
