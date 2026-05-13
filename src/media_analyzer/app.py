@@ -39,10 +39,6 @@ QTableView {
     selection-background-color: #264f78;
     selection-color: #ffffff;
 }
-QTableView::item {
-    padding: 2px 6px;
-    border: none;
-}
 QTableView::item:selected {
     background-color: #264f78;
     color: #ffffff;
@@ -166,6 +162,9 @@ def create_application(argv=None) -> QApplication:
     app.setApplicationVersion("0.1.0")
     app.setOrganizationName("MediaAnalyzer")
 
+    # Set application icon (visible in taskbar and window title)
+    _set_app_icon(app)
+
     # Use Fusion style for consistent cross-platform look
     app.setStyle("Fusion")
 
@@ -173,6 +172,64 @@ def create_application(argv=None) -> QApplication:
     apply_dark_theme(app)
 
     return app
+
+
+def _set_app_icon(app: QApplication) -> None:
+    """Set application icon from resources. Works on Windows, macOS, and Linux."""
+    import os
+    from PySide6.QtGui import QIcon, QPixmap
+
+    # Find icon relative to this file's location
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    icon_dir = os.path.join(base_dir, "resources", "icons")
+
+    icon = QIcon()
+
+    # Add multiple sizes for best rendering across platforms and DPI scales
+    # macOS Retina needs 128/256/512, Windows needs 16/32/48, Linux needs 48/64/128
+    for size in (16, 32, 48, 64, 128, 256, 512):
+        png_path = os.path.join(icon_dir, f"app_icon_{size}.png")
+        if os.path.exists(png_path):
+            icon.addFile(png_path)
+
+    # Fallback: try SVG (Qt renders at any resolution, ideal for HiDPI)
+    svg_path = os.path.join(icon_dir, "app_icon.svg")
+    if os.path.exists(svg_path):
+        icon.addFile(svg_path)
+
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+
+    # macOS: also set the Dock icon explicitly
+    # When running as a script (not .app bundle), the Dock shows Python icon.
+    # Setting NSApplication's applicationIconImage fixes this.
+    import platform
+    if platform.system() == "Darwin":
+        _set_macos_dock_icon(icon_dir)
+
+
+def _set_macos_dock_icon(icon_dir: str) -> None:
+    """Set macOS Dock icon using native API (pyobjc or ctypes fallback)."""
+    import os
+
+    png_path = os.path.join(icon_dir, "app_icon_256.png")
+    if not os.path.exists(png_path):
+        return
+
+    try:
+        # Try pyobjc (if available)
+        from Foundation import NSData
+        from AppKit import NSApplication, NSImage
+
+        icon_data = NSData.dataWithContentsOfFile_(png_path)
+        if icon_data:
+            icon_image = NSImage.alloc().initWithData_(icon_data)
+            if icon_image:
+                NSApplication.sharedApplication().setApplicationIconImage_(icon_image)
+    except ImportError:
+        # pyobjc not available — try ctypes approach via Qt
+        # Qt's setWindowIcon usually works for Dock on modern macOS + Qt6
+        pass
 
 
 def apply_dark_theme(app: QApplication) -> None:

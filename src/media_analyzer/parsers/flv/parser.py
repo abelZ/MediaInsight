@@ -1041,6 +1041,9 @@ class FLVParser(BaseParser):
             decoder = AMF0Decoder(data)
             values = decoder.decode_all()
 
+            # Store all AMF values for full display
+            packet.script_amf_values = values
+
             if values and isinstance(values[0], str):
                 packet.script_name = values[0]
 

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Background circle -->
+  <circle cx="32" cy="32" r="30" fill="#1e1e2e" stroke="#4a6fa5" stroke-width="2"/>
+  <!-- Film strip / media icon -->
+  <rect x="14" y="18" width="36" height="28" rx="3" fill="none" stroke="#6cb4ee" stroke-width="2.5"/>
+  <!-- Horizontal dividers (hex rows) -->
+  <line x1="14" y1="25" x2="50" y2="25" stroke="#4a8ab5" stroke-width="1" opacity="0.6"/>
+  <line x1="14" y1="32" x2="50" y2="32" stroke="#4a8ab5" stroke-width="1" opacity="0.6"/>
+  <line x1="14" y1="39" x2="50" y2="39" stroke="#4a8ab5" stroke-width="1" opacity="0.6"/>
+  <!-- Vertical separator -->
+  <line x1="28" y1="18" x2="28" y2="46" stroke="#4a8ab5" stroke-width="1" opacity="0.6"/>
+  <!-- Binary/hex dots representing data -->
+  <circle cx="19" cy="21.5" r="1.5" fill="#8cb4ff"/>
+  <circle cx="24" cy="21.5" r="1.5" fill="#8cff8c"/>
+  <circle cx="19" cy="28.5" r="1.5" fill="#8cb4ff"/>
+  <circle cx="24" cy="28.5" r="1.5" fill="#ffdc8c"/>
+  <circle cx="19" cy="35.5" r="1.5" fill="#8cff8c"/>
+  <circle cx="24" cy="35.5" r="1.5" fill="#8cb4ff"/>
+  <circle cx="19" cy="42.5" r="1.5" fill="#ffdc8c"/>
+  <circle cx="24" cy="42.5" r="1.5" fill="#8cb4ff"/>
+  <!-- Magnifying glass overlay (analysis) -->
+  <circle cx="42" cy="36" r="8" fill="none" stroke="#a0d0ff" stroke-width="2"/>
+  <line x1="48" y1="42" x2="53" y2="47" stroke="#a0d0ff" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Play triangle inside magnifier -->
+  <polygon points="39,33 39,39 44,36" fill="#a0d0ff" opacity="0.8"/>
+</svg>

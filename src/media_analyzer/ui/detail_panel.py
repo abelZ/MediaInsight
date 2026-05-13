@@ -356,16 +356,104 @@ class DetailPanelWidget(QWidget):
         script_item.setExpanded(True)
         script_item.setData(0, BYTE_RANGE_ROLE, (D, packet.data_size))
 
-        if packet.script_name:
-            # AMF0 string: type(1) + length(2) + string_data
+        if packet.script_amf_values:
+            # Display all AMF values recursively
+            for i, value in enumerate(packet.script_amf_values):
+                amf_type = self._get_amf_type_name(value)
+                if i == 0 and isinstance(value, str):
+                    # First value is typically the event name
+                    item = QTreeWidgetItem(script_item,
+                        [f"[{i}] Event Name", f'"{value}"'])
+                    item.setData(0, BYTE_RANGE_ROLE, (D, 3 + len(value.encode("utf-8"))))
+                else:
+                    label = f"[{i}] {amf_type}"
+                    self._add_amf_value(script_item, label, value)
+        elif packet.script_name:
+            # Fallback if amf_values not available
             name_len = len(packet.script_name.encode("utf-8"))
             self._add_field(script_item, "Event Name", packet.script_name,
                             byte_range=(D, 3 + name_len))
+            if packet.script_data:
+                metadata_item = QTreeWidgetItem(script_item, ["Metadata", ""])
+                metadata_item.setExpanded(True)
+                self._add_amf_value_recursive(metadata_item, packet.script_data)
 
-        if packet.script_data:
-            metadata_item = QTreeWidgetItem(script_item, ["Metadata", ""])
-            metadata_item.setExpanded(True)
-            self._add_dict_fields(metadata_item, packet.script_data)
+    def _add_amf_value(self, parent: QTreeWidgetItem, label: str, value: Any) -> None:
+        """Add an AMF value to the tree with proper type display."""
+        if isinstance(value, dict):
+            item = QTreeWidgetItem(parent,
+                [label, f"Object ({len(value)} properties)"])
+            item.setExpanded(True)
+            self._add_amf_value_recursive(item, value)
+        elif isinstance(value, list):
+            item = QTreeWidgetItem(parent,
+                [label, f"Array [{len(value)} items]"])
+            item.setExpanded(len(value) <= 10)
+            for i, v in enumerate(value):
+                sub_type = self._get_amf_type_name(v)
+                self._add_amf_value(item, f"[{i}] {sub_type}", v)
+        elif isinstance(value, str):
+            self._add_field(parent, label, f'"{value}"')
+        elif isinstance(value, bool):
+            self._add_field(parent, label, "true" if value else "false")
+        elif isinstance(value, float):
+            # AMF Number — show integer if whole, else float
+            if value == int(value) and abs(value) < 2**53:
+                self._add_field(parent, label, str(int(value)))
+            else:
+                self._add_field(parent, label, f"{value:.6g}")
+        elif value is None:
+            self._add_field(parent, label, "null")
+        else:
+            self._add_field(parent, label, str(value))
+
+    def _add_amf_value_recursive(self, parent: QTreeWidgetItem,
+                                  data: Dict[str, Any]) -> None:
+        """Recursively add AMF object/dict fields to tree."""
+        for key, value in data.items():
+            amf_type = self._get_amf_type_name(value)
+            if isinstance(value, dict):
+                item = QTreeWidgetItem(parent,
+                    [str(key), f"Object ({len(value)} properties)"])
+                item.setExpanded(False)
+                self._add_amf_value_recursive(item, value)
+            elif isinstance(value, list):
+                item = QTreeWidgetItem(parent,
+                    [str(key), f"Array [{len(value)} items]"])
+                item.setExpanded(False)
+                for i, v in enumerate(value):
+                    sub_type = self._get_amf_type_name(v)
+                    self._add_amf_value(item, f"[{i}] {sub_type}", v)
+            elif isinstance(value, str):
+                self._add_field(parent, str(key), f'"{value}"')
+            elif isinstance(value, bool):
+                self._add_field(parent, str(key), "true" if value else "false")
+            elif isinstance(value, float):
+                if value == int(value) and abs(value) < 2**53:
+                    self._add_field(parent, str(key), str(int(value)))
+                else:
+                    self._add_field(parent, str(key), f"{value:.6g}")
+            elif value is None:
+                self._add_field(parent, str(key), "null")
+            else:
+                self._add_field(parent, str(key), str(value))
+
+    @staticmethod
+    def _get_amf_type_name(value: Any) -> str:
+        """Get AMF0 type name for display."""
+        if isinstance(value, str):
+            return "String"
+        elif isinstance(value, bool):
+            return "Boolean"
+        elif isinstance(value, (int, float)):
+            return "Number"
+        elif isinstance(value, dict):
+            return "Object"
+        elif isinstance(value, list):
+            return "StrictArray"
+        elif value is None:
+            return "Null"
+        return "Unknown"
 
     def _add_dict_fields(self, parent: QTreeWidgetItem, data: Dict[str, Any],
                          max_depth: int = 3) -> None:

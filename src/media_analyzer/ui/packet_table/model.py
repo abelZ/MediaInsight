@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QFont
 from typing import List, Optional
 
-from media_analyzer.core.models import PacketInfo, TagType
+from media_analyzer.core.models import PacketInfo, TagType, FrameType, AVCPacketType
 
 
 # Column definitions: (header_name, attribute_or_property, width_hint)
@@ -23,6 +23,7 @@ COLUMNS = [
 ]
 
 # Row background colors by tag type (dark theme)
+# Base colors — actual color varies by sub-type and alternating row
 TYPE_BG_COLORS = {
     TagType.HEADER: QColor(60, 30, 60),      # Dark purple
     TagType.VIDEO:  QColor(30, 40, 70),      # Dark blue
@@ -37,6 +38,44 @@ TYPE_FG_COLORS = {
     TagType.AUDIO:  QColor(140, 255, 140),   # Light green
     TagType.SCRIPT: QColor(255, 220, 140),   # Light yellow
 }
+
+# Special video sub-type colors
+VIDEO_IDR_BG = QColor(40, 45, 90)           # Brighter blue for I-frames
+VIDEO_IDR_FG = QColor(180, 210, 255)        # Bright text for I-frames
+VIDEO_SEQ_BG = QColor(50, 35, 80)           # Purple-ish for sequence headers
+VIDEO_SEQ_FG = QColor(200, 170, 255)        # Light purple for seq headers
+
+
+def _get_row_colors(packet: PacketInfo, row: int):
+    """
+    Get (background, foreground) colors for a packet row.
+    Considers tag type, video sub-type, and alternating rows.
+    """
+    tag_type = packet.tag_type
+
+    # Default
+    bg = TYPE_BG_COLORS.get(tag_type, QColor(30, 30, 40))
+    fg = TYPE_FG_COLORS.get(tag_type, QColor(200, 200, 200))
+
+    if tag_type == TagType.VIDEO:
+        # Sequence headers get special color
+        if packet.avc_packet_type == AVCPacketType.SEQUENCE_HEADER:
+            bg = VIDEO_SEQ_BG
+            fg = VIDEO_SEQ_FG
+        # I-frames get brighter color
+        elif packet.frame_type == FrameType.KEY:
+            bg = VIDEO_IDR_BG
+            fg = VIDEO_IDR_FG
+
+    # Alternating row brightness (subtle ±8 on RGB)
+    if row % 2 == 1:
+        bg = QColor(
+            min(255, bg.red() + 8),
+            min(255, bg.green() + 8),
+            min(255, bg.blue() + 8),
+        )
+
+    return bg, fg
 
 
 class PacketTableModel(QAbstractTableModel):
@@ -75,9 +114,11 @@ class PacketTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole:
             return self._format_cell(packet, col_attr)
         elif role == Qt.ItemDataRole.BackgroundRole:
-            return TYPE_BG_COLORS.get(packet.tag_type)
+            bg, _ = _get_row_colors(packet, index.row())
+            return bg
         elif role == Qt.ItemDataRole.ForegroundRole:
-            return TYPE_FG_COLORS.get(packet.tag_type, QColor(200, 200, 200))
+            _, fg = _get_row_colors(packet, index.row())
+            return fg
         elif role == Qt.ItemDataRole.TextAlignmentRole:
             # Right-align numeric columns
             if col_attr in ("index", "timestamp", "data_size", "offset",

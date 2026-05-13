@@ -206,6 +206,7 @@ class PacketInfo:
     # Script-specific
     script_name: Optional[str] = None
     script_data: Optional[Dict[str, Any]] = None
+    script_amf_values: Optional[List[Any]] = None  # All decoded AMF0 values
 
     # NALU list for video frames containing multiple NALUs
     nalu_list: Optional[List[NALUInfo]] = None
