@@ -22,28 +22,43 @@ COLUMNS = [
     ("Detail",      "detail_label",     200),
 ]
 
-# Row background colors by tag type (dark theme)
-# Base colors — actual color varies by sub-type and alternating row
+# Extra columns for TS packet view
+TS_PKT_COLUMNS = [
+    ("No.",         "index",            60),
+    ("Type",        "type_label",       70),
+    ("PID",         "_pid",             60),
+    ("CC",          "_cc",              35),
+    ("PUSI",        "_pusi",            45),
+    ("Timestamp",   "timestamp",        90),
+    ("Size",        "data_size",        70),
+    ("Offset",      "offset",           90),
+    ("Codec",       "codec_label",      90),
+    ("Frame",       "frame_label",      60),
+    ("Detail",      "detail_label",     200),
+]
+
+# Row background colors by tag type (dark theme, subtle tints)
+# Very subtle color differences on a near-neutral dark base
 TYPE_BG_COLORS = {
-    TagType.HEADER: QColor(60, 30, 60),      # Dark purple
-    TagType.VIDEO:  QColor(30, 40, 70),      # Dark blue
-    TagType.AUDIO:  QColor(30, 60, 40),      # Dark green
-    TagType.SCRIPT: QColor(60, 55, 30),      # Dark yellow/brown
+    TagType.HEADER: QColor(38, 32, 42),      # Very subtle purple tint
+    TagType.VIDEO:  QColor(30, 34, 44),      # Very subtle blue tint
+    TagType.AUDIO:  QColor(30, 38, 34),      # Very subtle green tint
+    TagType.SCRIPT: QColor(38, 36, 30),      # Very subtle warm tint
 }
 
-# Row text colors by tag type
+# Row text colors by tag type (readable but not glaring)
 TYPE_FG_COLORS = {
-    TagType.HEADER: QColor(220, 160, 255),   # Light purple
-    TagType.VIDEO:  QColor(140, 180, 255),   # Light blue
-    TagType.AUDIO:  QColor(140, 255, 140),   # Light green
-    TagType.SCRIPT: QColor(255, 220, 140),   # Light yellow
+    TagType.HEADER: QColor(180, 160, 200),   # Soft purple
+    TagType.VIDEO:  QColor(160, 185, 220),   # Soft blue
+    TagType.AUDIO:  QColor(160, 200, 170),   # Soft green
+    TagType.SCRIPT: QColor(200, 190, 150),   # Soft yellow
 }
 
-# Special video sub-type colors
-VIDEO_IDR_BG = QColor(40, 45, 90)           # Brighter blue for I-frames
-VIDEO_IDR_FG = QColor(180, 210, 255)        # Bright text for I-frames
-VIDEO_SEQ_BG = QColor(50, 35, 80)           # Purple-ish for sequence headers
-VIDEO_SEQ_FG = QColor(200, 170, 255)        # Light purple for seq headers
+# Special video sub-type colors (still subtle)
+VIDEO_IDR_BG = QColor(32, 36, 50)           # Slightly brighter blue for I-frames
+VIDEO_IDR_FG = QColor(170, 195, 230)        # Soft bright blue
+VIDEO_SEQ_BG = QColor(36, 32, 46)           # Slightly purple for sequence headers
+VIDEO_SEQ_FG = QColor(175, 160, 210)        # Soft purple
 
 
 def _get_row_colors(packet: PacketInfo, row: int):
@@ -84,11 +99,23 @@ class PacketTableModel(QAbstractTableModel):
 
     Qt's model/view architecture means only VISIBLE rows are ever
     queried - no matter if the list has millions of entries.
+
+    Supports switching column layout (standard vs TS packet view).
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._packets: List[PacketInfo] = []
+        self._columns = COLUMNS  # Active column set
+
+    def set_column_mode(self, mode: str) -> None:
+        """Switch column layout. mode: 'standard' or 'ts_pkt'."""
+        self.beginResetModel()
+        if mode == "ts_pkt":
+            self._columns = TS_PKT_COLUMNS
+        else:
+            self._columns = COLUMNS
+        self.endResetModel()
 
     # --- Qt Model Interface ---
 
@@ -100,7 +127,7 @@ class PacketTableModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()) -> int:
         if parent.isValid():
             return 0
-        return len(COLUMNS)
+        return len(self._columns)
 
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
@@ -109,7 +136,7 @@ class PacketTableModel(QAbstractTableModel):
             return None
 
         packet = self._packets[index.row()]
-        col_name, col_attr, _ = COLUMNS[index.column()]
+        col_name, col_attr, _ = self._columns[index.column()]
 
         if role == Qt.ItemDataRole.DisplayRole:
             return self._format_cell(packet, col_attr)
@@ -122,8 +149,10 @@ class PacketTableModel(QAbstractTableModel):
         elif role == Qt.ItemDataRole.TextAlignmentRole:
             # Right-align numeric columns
             if col_attr in ("index", "timestamp", "data_size", "offset",
-                           "composition_time", "dts", "pts"):
+                           "composition_time", "dts", "pts", "_pid", "_cc"):
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            elif col_attr == "_pusi":
+                return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.UserRole:
             return packet  # For selection handling
@@ -136,7 +165,8 @@ class PacketTableModel(QAbstractTableModel):
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role == Qt.ItemDataRole.DisplayRole:
             if orientation == Qt.Orientation.Horizontal:
-                return COLUMNS[section][0]
+                if section < len(self._columns):
+                    return self._columns[section][0]
             elif orientation == Qt.Orientation.Vertical:
                 return str(section)
         elif role == Qt.ItemDataRole.TextAlignmentRole:
@@ -179,6 +209,21 @@ class PacketTableModel(QAbstractTableModel):
 
     def _format_cell(self, packet: PacketInfo, attr: str) -> str:
         """Format a cell value for display."""
+        # TS-specific virtual columns (from script_data)
+        if attr == "_pid":
+            if packet.script_data and "pid" in packet.script_data:
+                pid = packet.script_data["pid"]
+                return f"{pid}"
+            return str(packet.stream_id) if packet.stream_id else ""
+        elif attr == "_cc":
+            if packet.script_data and "continuity_counter" in packet.script_data:
+                return str(packet.script_data["continuity_counter"])
+            return ""
+        elif attr == "_pusi":
+            if packet.script_data and "pusi" in packet.script_data:
+                return "1" if packet.script_data["pusi"] else "0"
+            return ""
+
         value = getattr(packet, attr, None)
 
         if value is None:

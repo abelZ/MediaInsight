@@ -196,6 +196,30 @@ class MainWindow(QMainWindow):
         show_all_action.triggered.connect(self._show_all_filters)
         filter_menu.addAction(show_all_action)
 
+        # --- View Menu ---
+        view_menu = menubar.addMenu("View")
+
+        self._view_group = None  # Will hold QActionGroup for TS views
+
+        self._view_pkt_action = QAction("TS Packet View", self)
+        self._view_pkt_action.setCheckable(True)
+        self._view_pkt_action.setShortcut(QKeySequence("Ctrl+Shift+1"))
+        self._view_pkt_action.triggered.connect(self._switch_to_pkt_view)
+        view_menu.addAction(self._view_pkt_action)
+
+        self._view_pes_action = QAction("TS PES View", self)
+        self._view_pes_action.setCheckable(True)
+        self._view_pes_action.setShortcut(QKeySequence("Ctrl+Shift+2"))
+        self._view_pes_action.triggered.connect(self._switch_to_pes_view)
+        view_menu.addAction(self._view_pes_action)
+
+        self._view_standard_action = QAction("Standard View", self)
+        self._view_standard_action.setCheckable(True)
+        self._view_standard_action.setChecked(True)
+        self._view_standard_action.setShortcut(QKeySequence("Ctrl+Shift+3"))
+        self._view_standard_action.triggered.connect(self._switch_to_standard_view)
+        view_menu.addAction(self._view_standard_action)
+
     def _setup_statusbar(self):
         """Build the status bar."""
         statusbar = self.statusBar()
@@ -248,7 +272,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Media File",
             "",
-            "FLV Files (*.flv);;All Media Files (*.flv *.mp4 *.ts);;All Files (*)"
+            "Media Files (*.flv *.ts *.m2ts);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;All Files (*)"
         )
         if path:
             source = FileSource(path)
@@ -301,6 +325,30 @@ class MainWindow(QMainWindow):
         self._filter_idr_action.setChecked(False)
         self._filter_sei_action.setChecked(False)
 
+    # --- View Switching ---
+
+    def _switch_to_pkt_view(self):
+        """Switch to TS Packet view (every 188-byte packet as a row, with CC column)."""
+        self._view_pkt_action.setChecked(True)
+        self._view_pes_action.setChecked(False)
+        self._view_standard_action.setChecked(False)
+        self._table_view.set_ts_pkt_view(True)
+
+    def _switch_to_pes_view(self):
+        """Switch to PES view (only frame-start packets shown)."""
+        self._view_pkt_action.setChecked(False)
+        self._view_pes_action.setChecked(True)
+        self._view_standard_action.setChecked(False)
+        self._table_view.set_pes_view(True)
+
+    def _switch_to_standard_view(self):
+        """Switch to standard view (FLV-style, no TS columns)."""
+        self._view_pkt_action.setChecked(False)
+        self._view_pes_action.setChecked(False)
+        self._view_standard_action.setChecked(True)
+        self._table_view.set_ts_pkt_view(False)
+        self._table_view.set_pes_view(False)
+
     # --- Parsing ---
 
     def _start_parsing(self, source):
@@ -332,11 +380,18 @@ class MainWindow(QMainWindow):
 
     def _on_packets_ready(self, packets):
         """Handle batch of parsed packets from worker."""
+        # Temporarily disable view updates for performance
+        self._table_view.setUpdatesEnabled(False)
         self._table_model.append_packets(packets)
+        self._table_view.setUpdatesEnabled(True)
 
         # Update status (lightweight — just show count)
         count = self._table_model.packet_count
         self._status_label.setText(f"{count:,} tags loaded")
+
+        # Process pending user events (clicks, keyboard) to keep UI interactive
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
 
     def _on_progress(self, current: int, total: int):
         """Update progress bar."""
@@ -373,6 +428,12 @@ class MainWindow(QMainWindow):
 
         # Update window title
         self.setWindowTitle(f"Media Analyzer - {stream_info.source_path}")
+
+        # Auto-switch view based on format
+        if stream_info.format_name == "MPEG-TS":
+            self._switch_to_pkt_view()
+        else:
+            self._switch_to_standard_view()
 
     def _on_parse_error(self, error_msg: str):
         """Handle parsing error."""

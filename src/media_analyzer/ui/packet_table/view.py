@@ -4,7 +4,7 @@ from PySide6.QtWidgets import QTableView, QHeaderView, QAbstractItemView
 from PySide6.QtCore import Qt, Signal, QModelIndex, QSortFilterProxyModel
 
 from media_analyzer.core.models import PacketInfo, TagType, FrameType, H264NALUType
-from media_analyzer.ui.packet_table.model import PacketTableModel, COLUMNS
+from media_analyzer.ui.packet_table.model import PacketTableModel, COLUMNS, TS_PKT_COLUMNS
 
 
 class PacketFilterProxyModel(QSortFilterProxyModel):
@@ -24,9 +24,11 @@ class PacketFilterProxyModel(QSortFilterProxyModel):
         self._show_audio = True
         self._show_script = True
         # Narrowing filters (only affect video tags)
-        self._only_idr = False       # When True, only show IDR (I-frame) video tags
-        self._only_has_sei = False   # When True, only show video tags containing SEI NALUs
-        self._all_visible = True     # Fast path flag
+        self._only_idr = False
+        self._only_has_sei = False
+        # TS PES view mode: only show PUSI=1 packets (frame starts)
+        self._pes_view = False
+        self._all_visible = True  # Fast path flag
 
     def set_filter(self, show_video: bool, show_audio: bool, show_script: bool,
                    only_idr: bool = False, only_has_sei: bool = False) -> None:
@@ -43,12 +45,24 @@ class PacketFilterProxyModel(QSortFilterProxyModel):
         self._show_script = show_script
         self._only_idr = only_idr
         self._only_has_sei = only_has_sei
-        self._all_visible = (
-            show_video and show_audio and show_script
-            and not only_idr and not only_has_sei
-        )
+        self._update_fast_path()
         if changed:
             self.invalidateFilter()
+
+    def set_pes_view(self, enabled: bool) -> None:
+        """Enable/disable PES view (only show PUSI=1 frame-start packets)."""
+        if self._pes_view != enabled:
+            self._pes_view = enabled
+            self._update_fast_path()
+            self.invalidateFilter()
+
+    def _update_fast_path(self) -> None:
+        """Update the fast-path flag."""
+        self._all_visible = (
+            self._show_video and self._show_audio and self._show_script
+            and not self._only_idr and not self._only_has_sei
+            and not self._pes_view
+        )
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         """Decide if a row passes the filter."""
@@ -66,12 +80,22 @@ class PacketFilterProxyModel(QSortFilterProxyModel):
 
         tag_type = packet.tag_type
 
+        # PES view: only show PUSI=1 packets (frame starts) + header + PSI
+        if self._pes_view:
+            if tag_type == TagType.HEADER:
+                return True
+            if tag_type == TagType.SCRIPT:
+                # Show PAT/PMT in PES view
+                return self._show_script
+            # For video/audio: only show if PUSI=1
+            if packet.script_data and not packet.script_data.get("pusi"):
+                return False
+
         if tag_type == TagType.HEADER:
             return self._show_header
         elif tag_type == TagType.VIDEO:
             if not self._show_video:
                 return False
-            # Apply narrowing filters for video
             if self._only_idr:
                 if packet.frame_type != FrameType.KEY:
                     return False
@@ -160,8 +184,7 @@ class PacketTableView(QTableView):
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Set column widths from hints
-        for i, (_, _, width) in enumerate(COLUMNS):
-            self.setColumnWidth(i, width)
+        self._apply_column_widths(COLUMNS)
 
         # Visual settings
         self.setShowGrid(False)
@@ -174,6 +197,30 @@ class PacketTableView(QTableView):
 
         # Enable sorting
         self.setSortingEnabled(False)  # Disable for now, packets are in order
+
+    def _apply_column_widths(self, columns) -> None:
+        """Apply column width hints."""
+        for i, (_, _, width) in enumerate(columns):
+            self.setColumnWidth(i, width)
+
+    def set_ts_pkt_view(self, enabled: bool) -> None:
+        """Switch between TS packet view and standard/PES view."""
+        if enabled:
+            self._source_model.set_column_mode("ts_pkt")
+            self._apply_column_widths(TS_PKT_COLUMNS)
+            self._proxy_model.set_pes_view(False)
+        else:
+            self._source_model.set_column_mode("standard")
+            self._apply_column_widths(COLUMNS)
+
+    def set_pes_view(self, enabled: bool) -> None:
+        """Switch to PES view (only PUSI=1 frame-start packets)."""
+        if enabled:
+            self._source_model.set_column_mode("standard")
+            self._apply_column_widths(COLUMNS)
+            self._proxy_model.set_pes_view(True)
+        else:
+            self._proxy_model.set_pes_view(False)
 
     def currentChanged(self, current: QModelIndex, previous: QModelIndex):
         """Handle row selection change."""

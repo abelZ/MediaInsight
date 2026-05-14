@@ -116,6 +116,11 @@ class DetailPanelWidget(QWidget):
             self._show_header_details(packet)
             return
 
+        # TS packet (identified by script_data containing "pid" key)
+        if packet.script_data and "pid" in packet.script_data:
+            self._show_ts_packet_details(packet)
+            return
+
         #
         # FLV Tag Header layout (11 bytes):
         #   Byte 0:    TagType
@@ -199,8 +204,195 @@ class DetailPanelWidget(QWidget):
                         f"{hi.data_offset} bytes", byte_range=(5, 4))
 
     # -------------------------------------------------------------------------
-    # Video tag
+    # TS packet detail
     # -------------------------------------------------------------------------
+
+    def _show_ts_packet_details(self, packet: PacketInfo) -> None:
+        """Display TS packet header fields and PES info if present."""
+        d = packet.script_data
+
+        # TS Header section
+        ts_hdr = QTreeWidgetItem(self._tree, ["TS Packet Header", ""])
+        ts_hdr.setExpanded(True)
+        ts_hdr.setData(0, BYTE_RANGE_ROLE, (0, 4))
+
+        pid = d.get("pid", 0)
+        self._add_field(ts_hdr, "PID", f"{pid} ({d.get('pid_hex', '')})",
+                        byte_range=(1, 2))
+        self._add_field(ts_hdr, "PUSI (Payload Unit Start)",
+                        "Yes" if d.get("pusi") else "No", byte_range=(1, 1))
+        self._add_field(ts_hdr, "TEI (Transport Error)",
+                        "Yes" if d.get("tei") else "No", byte_range=(1, 1))
+        self._add_field(ts_hdr, "Priority",
+                        "Yes" if d.get("priority") else "No", byte_range=(1, 1))
+        self._add_field(ts_hdr, "Transport Scrambling",
+                        str(d.get("tsc", 0)), byte_range=(3, 1))
+
+        afc = d.get("adaptation_field_control", 0)
+        afc_desc = {0: "Reserved", 1: "Payload only", 2: "AF only", 3: "AF + Payload"}.get(afc, str(afc))
+        self._add_field(ts_hdr, "Adaptation Field Control",
+                        f"{afc} ({afc_desc})", byte_range=(3, 1))
+        self._add_field(ts_hdr, "Continuity Counter",
+                        str(d.get("continuity_counter", 0)), byte_range=(3, 1))
+        self._add_field(ts_hdr, "Payload Size",
+                        f"{d.get('payload_size', 0)} bytes")
+        self._add_field(ts_hdr, "Offset",
+                        f"0x{packet.offset:08X} ({packet.offset:,})")
+
+        # Adaptation Field
+        af = d.get("adaptation_field")
+        if af:
+            af_item = QTreeWidgetItem(self._tree, ["Adaptation Field", ""])
+            af_item.setExpanded(True)
+
+            flags = af.get("flags", [])
+            if flags:
+                self._add_field(af_item, "Flags", ", ".join(flags))
+            if "pcr_ms" in af:
+                self._add_field(af_item, "PCR",
+                               f"{af['pcr_ms']:.3f} ms (base={af.get('pcr_base', 0)})")
+            if af.get("random_access"):
+                self._add_field(af_item, "Random Access Point", "Yes")
+
+        # Stream info
+        stream_type = d.get("stream_type")
+        if stream_type is not None:
+            stream_item = QTreeWidgetItem(self._tree, ["Stream", ""])
+            stream_item.setExpanded(True)
+            self._add_field(stream_item, "Stream Type",
+                           f"0x{stream_type:02X} ({d.get('stream_type_name', '')})")
+            self._add_field(stream_item, "PID", f"{pid} ({d.get('pid_hex', '')})")
+
+            category = "Video" if packet.tag_type == TagType.VIDEO else \
+                       "Audio" if packet.tag_type == TagType.AUDIO else "Data"
+            self._add_field(stream_item, "Category", category)
+
+            if packet.video_codec:
+                self._add_field(stream_item, "Codec", packet.video_codec.name)
+            if packet.frame_type:
+                self._add_field(stream_item, "Frame Type", packet.frame_label)
+
+        # PES Header (only on PUSI=1 packets)
+        pes = d.get("pes")
+        if pes:
+            pes_item = QTreeWidgetItem(self._tree, ["PES Header (Frame Start)", ""])
+            pes_item.setExpanded(True)
+
+            self._add_field(pes_item, "Stream ID",
+                           pes.get("stream_id_hex", ""))
+            self._add_field(pes_item, "PES Packet Length",
+                           str(pes.get("pes_packet_length", 0)))
+            self._add_field(pes_item, "PES Header Data Length",
+                           str(pes.get("pes_header_data_length", 0)))
+
+            if pes.get("data_alignment"):
+                self._add_field(pes_item, "Data Alignment", "Yes")
+            if pes.get("priority"):
+                self._add_field(pes_item, "Priority", "Yes")
+
+            # Timing
+            if "pts_ms" in pes:
+                pts_ms = pes["pts_ms"]
+                pts_raw = pes.get("pts", 0)
+                self._add_field(pes_item, "PTS",
+                               f"{pts_ms} ms (raw: {pts_raw})")
+            if "dts_ms" in pes:
+                dts_ms = pes["dts_ms"]
+                dts_raw = pes.get("dts", 0)
+                self._add_field(pes_item, "DTS",
+                               f"{dts_ms} ms (raw: {dts_raw})")
+            if "cts_ms" in pes:
+                self._add_field(pes_item, "CTS (PTS-DTS)",
+                               f"{pes['cts_ms']} ms")
+
+            # Keyframe indicator
+            if pes.get("is_keyframe"):
+                self._add_field(pes_item, "Keyframe", "Yes (IDR/RAP)")
+
+            # NALU types found
+            nalu_types = pes.get("nalu_types")
+            if nalu_types:
+                self._add_field(pes_item, "NALUs detected",
+                               ", ".join(nalu_types))
+
+        # PAT details
+        pat = d.get("pat")
+        if pat:
+            self._show_ts_psi_pat(pat)
+
+        # PMT details
+        pmt = d.get("pmt")
+        if pmt:
+            self._show_ts_psi_pmt(pmt)
+
+    def _show_ts_psi_pat(self, pat: Dict[str, Any]) -> None:
+        """Display PAT content."""
+        pat_item = QTreeWidgetItem(self._tree, ["PAT Content", ""])
+        pat_item.setExpanded(True)
+
+        self._add_field(pat_item, "Transport Stream ID",
+                       str(pat.get("transport_stream_id", 0)))
+        self._add_field(pat_item, "Version",
+                       str(pat.get("version_number", 0)))
+
+        programs = pat.get("programs", [])
+        prog_item = QTreeWidgetItem(pat_item,
+            ["Programs", f"{len(programs)} program(s)"])
+        prog_item.setExpanded(True)
+        for prog in programs:
+            pn = prog.get("program_number", 0)
+            pmt_pid = prog.get("pmt_pid", 0)
+            self._add_field(prog_item, f"Program {pn}",
+                           f"PMT PID = {pmt_pid} (0x{pmt_pid:04X})")
+
+    def _show_ts_psi_pmt(self, pmt: Dict[str, Any]) -> None:
+        """Display PMT content."""
+        pmt_item = QTreeWidgetItem(self._tree, ["PMT Content", ""])
+        pmt_item.setExpanded(True)
+
+        self._add_field(pmt_item, "Program Number",
+                       str(pmt.get("program_number", 0)))
+        self._add_field(pmt_item, "Version",
+                       str(pmt.get("version_number", 0)))
+        pcr_pid = pmt.get("pcr_pid", 0)
+        self._add_field(pmt_item, "PCR PID",
+                       f"{pcr_pid} (0x{pcr_pid:04X})")
+
+        # Program descriptors
+        prog_descs = pmt.get("program_descriptors", [])
+        if prog_descs:
+            pd_item = QTreeWidgetItem(pmt_item,
+                ["Program Descriptors", f"{len(prog_descs)}"])
+            pd_item.setExpanded(False)
+            self._show_descriptors(pd_item, prog_descs)
+
+        # Streams
+        streams = pmt.get("streams", [])
+        streams_item = QTreeWidgetItem(pmt_item,
+            ["Elementary Streams", f"{len(streams)} stream(s)"])
+        streams_item.setExpanded(True)
+
+        for stream in streams:
+            st = stream.get("stream_type", 0)
+            st_name = stream.get("stream_type_name", "Unknown")
+            es_pid = stream.get("elementary_pid", 0)
+            is_video = stream.get("is_video", False)
+            is_audio = stream.get("is_audio", False)
+            category = "Video" if is_video else "Audio" if is_audio else "Data"
+
+            s_item = QTreeWidgetItem(streams_item,
+                [f"PID {es_pid} (0x{es_pid:04X})", f"{st_name} [{category}]"])
+            s_item.setExpanded(False)
+
+            self._add_field(s_item, "Stream Type", f"0x{st:02X} ({st_name})")
+            self._add_field(s_item, "Category", category)
+
+            descs = stream.get("descriptors", [])
+            if descs:
+                d_item = QTreeWidgetItem(s_item,
+                    ["Descriptors", f"{len(descs)}"])
+                d_item.setExpanded(True)
+                self._show_descriptors(d_item, descs)
 
     def _show_video_details(self, packet: PacketInfo, tag_hdr: int) -> None:
         """
@@ -357,11 +549,10 @@ class DetailPanelWidget(QWidget):
         script_item.setData(0, BYTE_RANGE_ROLE, (D, packet.data_size))
 
         if packet.script_amf_values:
-            # Display all AMF values recursively
+            # FLV AMF: display all AMF values recursively
             for i, value in enumerate(packet.script_amf_values):
                 amf_type = self._get_amf_type_name(value)
                 if i == 0 and isinstance(value, str):
-                    # First value is typically the event name
                     item = QTreeWidgetItem(script_item,
                         [f"[{i}] Event Name", f'"{value}"'])
                     item.setData(0, BYTE_RANGE_ROLE, (D, 3 + len(value.encode("utf-8"))))
@@ -369,7 +560,7 @@ class DetailPanelWidget(QWidget):
                     label = f"[{i}] {amf_type}"
                     self._add_amf_value(script_item, label, value)
         elif packet.script_name:
-            # Fallback if amf_values not available
+            # Fallback
             name_len = len(packet.script_name.encode("utf-8"))
             self._add_field(script_item, "Event Name", packet.script_name,
                             byte_range=(D, 3 + name_len))
@@ -377,6 +568,28 @@ class DetailPanelWidget(QWidget):
                 metadata_item = QTreeWidgetItem(script_item, ["Metadata", ""])
                 metadata_item.setExpanded(True)
                 self._add_amf_value_recursive(metadata_item, packet.script_data)
+
+    def _show_descriptors(self, parent: QTreeWidgetItem,
+                           descriptors: list) -> None:
+        """Display MPEG-TS descriptors in the tree."""
+        for desc in descriptors:
+            tag = desc.get("tag", 0)
+            tag_name = desc.get("tag_name", f"0x{tag:02X}")
+            length = desc.get("length", 0)
+
+            desc_item = QTreeWidgetItem(parent,
+                [f"0x{tag:02X} {tag_name}", f"{length} bytes"])
+            desc_item.setExpanded(False)
+
+            # Show parsed fields
+            for key, value in desc.items():
+                if key in ("tag", "tag_name", "length", "raw_hex"):
+                    continue
+                self._add_field(desc_item, key, self._format_value(value))
+
+            # Show raw hex
+            if "raw_hex" in desc:
+                self._add_field(desc_item, "Raw Data", desc["raw_hex"])
 
     def _add_amf_value(self, parent: QTreeWidgetItem, label: str, value: Any) -> None:
         """Add an AMF value to the tree with proper type display."""

@@ -7,12 +7,15 @@ from media_analyzer.core.models import PacketInfo, StreamInfo
 from media_analyzer.core.source import DataSource
 from media_analyzer.parsers.base import BaseParser
 from media_analyzer.parsers.flv.parser import FLVParser
+from media_analyzer.parsers.ts.parser import TSParser
 
 
 # Emit packets to UI in batches for efficiency
-BATCH_SIZE = 1000
+BATCH_SIZE = 2000
 # Minimum interval between UI updates (ms) to avoid overwhelming the event loop
-MIN_EMIT_INTERVAL_MS = 50
+MIN_EMIT_INTERVAL_MS = 80
+# First batch emits sooner so user sees content immediately
+FIRST_BATCH_SIZE = 50
 
 
 class ParseWorker(QThread):
@@ -48,12 +51,14 @@ class ParseWorker(QThread):
         try:
             reader = self._source.open()
 
-            # Sniff format from first bytes
-            header_peek = reader.read(16)
+            # Sniff format from first bytes (need enough for TS detection: 2 packets)
+            header_peek = reader.read(400)
             reader.seek(0)
 
             if FLVParser.sniff(header_peek):
                 self._parser = FLVParser()
+            elif TSParser.sniff(header_peek):
+                self._parser = TSParser()
             else:
                 self.error.emit(f"Unsupported format (magic: {header_peek[:4].hex()})")
                 return
@@ -63,6 +68,7 @@ class ParseWorker(QThread):
             timer = QElapsedTimer()
             timer.start()
             last_emit_time = 0
+            first_batch_sent = False
 
             for packet in self._parser.parse_incremental(reader):
                 if not self._running:
@@ -70,7 +76,17 @@ class ParseWorker(QThread):
 
                 batch.append(packet)
 
-                # Emit when batch is full OR enough time has passed
+                # First batch: emit quickly so user sees content immediately
+                if not first_batch_sent and len(batch) >= FIRST_BATCH_SIZE:
+                    self.packets_ready.emit(batch.copy())
+                    batch.clear()
+                    first_batch_sent = True
+                    last_emit_time = timer.elapsed()
+                    # Yield to UI thread so it can process this batch
+                    QThread.msleep(1)
+                    continue
+
+                # Subsequent batches: emit when full OR enough time has passed
                 elapsed = timer.elapsed()
                 if len(batch) >= BATCH_SIZE or (elapsed - last_emit_time >= MIN_EMIT_INTERVAL_MS and batch):
                     self.packets_ready.emit(batch.copy())
@@ -83,6 +99,9 @@ class ParseWorker(QThread):
                             packet.offset + packet.data_size,
                             total_size
                         )
+
+                    # Brief yield to let UI process the batch
+                    QThread.msleep(1)
 
             # Emit remaining packets
             if batch and self._running:
