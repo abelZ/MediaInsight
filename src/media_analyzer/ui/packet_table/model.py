@@ -64,25 +64,40 @@ VIDEO_SEQ_FG = QColor(175, 160, 210)        # Soft purple
 def _get_row_colors(packet: PacketInfo, row: int):
     """
     Get (background, foreground) colors for a packet row.
-    Considers tag type, video sub-type, and alternating rows.
+    Uses theme colors dynamically if available.
     """
+    from media_analyzer.ui.themes import get_current_theme
+    theme = get_current_theme()
+
     tag_type = packet.tag_type
 
-    # Default
-    bg = TYPE_BG_COLORS.get(tag_type, QColor(30, 30, 40))
-    fg = TYPE_FG_COLORS.get(tag_type, QColor(200, 200, 200))
+    # Map tag type to theme colors
+    bg = QColor(*theme.row_video_bg)
+    fg = QColor(*theme.row_video_fg)
 
+    if tag_type == TagType.HEADER:
+        bg = QColor(*theme.row_header_bg)
+        fg = QColor(*theme.row_header_fg)
+    elif tag_type == TagType.VIDEO:
+        bg = QColor(*theme.row_video_bg)
+        fg = QColor(*theme.row_video_fg)
+    elif tag_type == TagType.AUDIO:
+        bg = QColor(*theme.row_audio_bg)
+        fg = QColor(*theme.row_audio_fg)
+    elif tag_type == TagType.SCRIPT:
+        bg = QColor(*theme.row_script_bg)
+        fg = QColor(*theme.row_script_fg)
+
+    # Video sub-type overrides
     if tag_type == TagType.VIDEO:
-        # Sequence headers get special color
         if packet.avc_packet_type == AVCPacketType.SEQUENCE_HEADER:
-            bg = VIDEO_SEQ_BG
-            fg = VIDEO_SEQ_FG
-        # I-frames get brighter color
+            bg = QColor(*theme.row_seq_bg)
+            fg = QColor(*theme.row_seq_fg)
         elif packet.frame_type == FrameType.KEY:
-            bg = VIDEO_IDR_BG
-            fg = VIDEO_IDR_FG
+            bg = QColor(*theme.row_idr_bg)
+            fg = QColor(*theme.row_idr_fg)
 
-    # Alternating row brightness (subtle ±8 on RGB)
+    # Alternating row brightness (subtle +8 on RGB)
     if row % 2 == 1:
         bg = QColor(
             min(255, bg.red() + 8),
@@ -101,12 +116,15 @@ class PacketTableModel(QAbstractTableModel):
     queried - no matter if the list has millions of entries.
 
     Supports switching column layout (standard vs TS packet view).
+    Supports PES view mode via pre-built PUSI index (O(1) switching).
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._packets: List[PacketInfo] = []
         self._columns = COLUMNS  # Active column set
+        self._pes_mode = False   # PES view: only show PUSI packets
+        self._pusi_indices: List[int] = []  # Pre-built index of PUSI packet positions
 
     def set_column_mode(self, mode: str) -> None:
         """Switch column layout. mode: 'standard' or 'ts_pkt'."""
@@ -117,11 +135,20 @@ class PacketTableModel(QAbstractTableModel):
             self._columns = COLUMNS
         self.endResetModel()
 
+    def set_pes_mode(self, enabled: bool) -> None:
+        """Switch PES view mode on/off. Uses pre-built index — instant switch."""
+        if self._pes_mode != enabled:
+            self.beginResetModel()
+            self._pes_mode = enabled
+            self.endResetModel()
+
     # --- Qt Model Interface ---
 
     def rowCount(self, parent=QModelIndex()) -> int:
         if parent.isValid():
             return 0
+        if self._pes_mode:
+            return len(self._pusi_indices)
         return len(self._packets)
 
     def columnCount(self, parent=QModelIndex()) -> int:
@@ -129,13 +156,26 @@ class PacketTableModel(QAbstractTableModel):
             return 0
         return len(self._columns)
 
+    def _get_packet_for_row(self, row: int) -> Optional[PacketInfo]:
+        """Map view row to PacketInfo (handles PES mode index mapping)."""
+        if self._pes_mode:
+            if 0 <= row < len(self._pusi_indices):
+                src_row = self._pusi_indices[row]
+                if src_row < len(self._packets):
+                    return self._packets[src_row]
+            return None
+        if 0 <= row < len(self._packets):
+            return self._packets[row]
+        return None
+
     def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
-        if index.row() >= len(self._packets):
+
+        packet = self._get_packet_for_row(index.row())
+        if packet is None:
             return None
 
-        packet = self._packets[index.row()]
         col_name, col_attr, _ = self._columns[index.column()]
 
         if role == Qt.ItemDataRole.DisplayRole:
@@ -180,26 +220,50 @@ class PacketTableModel(QAbstractTableModel):
         """
         Batch-append packets from parser worker thread.
         Uses beginInsertRows/endInsertRows for efficient model updates.
+        Also builds the PUSI index incrementally for PES view.
         """
         if not packets:
             return
-        start = len(self._packets)
-        end = start + len(packets) - 1
-        self.beginInsertRows(QModelIndex(), start, end)
-        self._packets.extend(packets)
-        self.endInsertRows()
+
+        base = len(self._packets)
+
+        # Build PUSI index entries for new packets
+        new_pusi_indices = []
+        for i, pkt in enumerate(packets):
+            if pkt.script_data and pkt.script_data.get("pusi"):
+                new_pusi_indices.append(base + i)
+
+        if self._pes_mode:
+            # In PES mode: insert only PUSI rows
+            if new_pusi_indices:
+                start = len(self._pusi_indices)
+                end = start + len(new_pusi_indices) - 1
+                self.beginInsertRows(QModelIndex(), start, end)
+                self._packets.extend(packets)
+                self._pusi_indices.extend(new_pusi_indices)
+                self.endInsertRows()
+            else:
+                # No PUSI packets in this batch, just append silently
+                self._packets.extend(packets)
+        else:
+            # Normal mode: insert all rows
+            start = base
+            end = start + len(packets) - 1
+            self.beginInsertRows(QModelIndex(), start, end)
+            self._packets.extend(packets)
+            self._pusi_indices.extend(new_pusi_indices)
+            self.endInsertRows()
 
     def clear(self) -> None:
         """Clear all packets."""
         self.beginResetModel()
         self._packets.clear()
+        self._pusi_indices.clear()
         self.endResetModel()
 
     def get_packet(self, row: int) -> Optional[PacketInfo]:
-        """Get packet at given row index."""
-        if 0 <= row < len(self._packets):
-            return self._packets[row]
-        return None
+        """Get packet at given row index (respects PES mode)."""
+        return self._get_packet_for_row(row)
 
     @property
     def packet_count(self) -> int:

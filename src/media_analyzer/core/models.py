@@ -244,6 +244,9 @@ class PacketInfo:
             return self.video_codec.name
         elif self.audio_codec is not None:
             return self.audio_codec.name
+        # Fallback for TS streams: use stream_type_name from script_data
+        elif self.script_data and "stream_type_name" in self.script_data:
+            return self.script_data["stream_type_name"]
         return ""
 
     @property

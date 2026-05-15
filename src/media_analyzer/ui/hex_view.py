@@ -17,21 +17,23 @@ from PySide6.QtCore import Qt
 
 
 class HexPanelHighlighter(QSyntaxHighlighter):
-    """Highlights the offset+hex panel: blue offsets, white hex bytes."""
+    """Highlights the offset+hex panel: colored offsets, themed hex bytes."""
 
     def __init__(self, document: QTextDocument, font: QFont):
         super().__init__(document)
+        from media_analyzer.ui.themes import get_current_theme
+        theme = get_current_theme()
 
         self._offset_fmt = QTextCharFormat()
-        self._offset_fmt.setForeground(QColor(130, 180, 230))
+        self._offset_fmt.setForeground(QColor(*theme.hex_offset_color))
         self._offset_fmt.setFont(font)
 
         self._hex_fmt = QTextCharFormat()
-        self._hex_fmt.setForeground(QColor(210, 210, 220))
+        self._hex_fmt.setForeground(QColor(*theme.hex_byte_color))
         self._hex_fmt.setFont(font)
 
         self._header_fmt = QTextCharFormat()
-        self._header_fmt.setForeground(QColor(100, 130, 160))
+        self._header_fmt.setForeground(QColor(*theme.hex_header_color))
         self._header_fmt.setFont(font)
 
     def highlightBlock(self, text: str):
@@ -58,17 +60,19 @@ class AsciiPanelHighlighter(QSyntaxHighlighter):
 
     def __init__(self, document: QTextDocument, font: QFont):
         super().__init__(document)
+        from media_analyzer.ui.themes import get_current_theme
+        theme = get_current_theme()
 
         self._printable_fmt = QTextCharFormat()
-        self._printable_fmt.setForeground(QColor(140, 210, 140))
+        self._printable_fmt.setForeground(QColor(*theme.hex_ascii_color))
         self._printable_fmt.setFont(font)
 
         self._dot_fmt = QTextCharFormat()
-        self._dot_fmt.setForeground(QColor(80, 80, 100))
+        self._dot_fmt.setForeground(QColor(*theme.hex_nonprint_color))
         self._dot_fmt.setFont(font)
 
         self._header_fmt = QTextCharFormat()
-        self._header_fmt.setForeground(QColor(100, 130, 160))
+        self._header_fmt.setForeground(QColor(*theme.hex_header_color))
         self._header_fmt.setFont(font)
 
     def highlightBlock(self, text: str):
@@ -113,14 +117,7 @@ def _make_text_edit(font: QFont) -> QPlainTextEdit:
     text_option.setWrapMode(QTextOption.WrapMode.NoWrap)
     doc.setDefaultTextOption(text_option)
 
-    edit.setStyleSheet("""
-        QPlainTextEdit {
-            background-color: #1a1a2e;
-            color: #d4d4d4;
-            border: 1px solid #333;
-            selection-background-color: #264f78;
-        }
-    """)
+    edit.setStyleSheet("")  # Rely on global theme stylesheet
     return edit
 
 
@@ -157,11 +154,9 @@ class HexViewWidget(QWidget):
         self._title.setFixedHeight(20)
         self._title.setStyleSheet("""
             QLabel {
-                color: #aaa;
                 font-weight: bold;
                 font-size: 11px;
                 padding: 1px 2px;
-                background-color: #252535;
             }
         """)
         outer.addWidget(self._title)
@@ -293,8 +288,10 @@ class HexViewWidget(QWidget):
 
         # Highlight format
         hl_fmt = QTextCharFormat()
-        hl_fmt.setBackground(QColor(80, 60, 20))      # Warm dark gold
-        hl_fmt.setForeground(QColor(255, 220, 100))    # Bright yellow text
+        from media_analyzer.ui.themes import get_current_theme
+        theme = get_current_theme()
+        hl_fmt.setBackground(QColor(*theme.hex_highlight_bg))
+        hl_fmt.setForeground(QColor(*theme.hex_highlight_fg))
 
         hex_selections = []
         ascii_selections = []

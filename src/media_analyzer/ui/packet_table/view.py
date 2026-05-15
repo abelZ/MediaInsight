@@ -1,6 +1,6 @@
 """Packet table view - QTableView subclass with optimized settings."""
 
-from PySide6.QtWidgets import QTableView, QHeaderView, QAbstractItemView
+from PySide6.QtWidgets import QTableView, QHeaderView, QAbstractItemView, QApplication
 from PySide6.QtCore import Qt, Signal, QModelIndex, QSortFilterProxyModel
 
 from media_analyzer.core.models import PacketInfo, TagType, FrameType, H264NALUType
@@ -205,7 +205,10 @@ class PacketTableView(QTableView):
 
     def set_ts_pkt_view(self, enabled: bool) -> None:
         """Switch between TS packet view and standard/PES view."""
+        self.setUpdatesEnabled(False)
+
         if enabled:
+            self._source_model.set_pes_mode(False)
             self._source_model.set_column_mode("ts_pkt")
             self._apply_column_widths(TS_PKT_COLUMNS)
             self._proxy_model.set_pes_view(False)
@@ -213,14 +216,25 @@ class PacketTableView(QTableView):
             self._source_model.set_column_mode("standard")
             self._apply_column_widths(COLUMNS)
 
+        self.setUpdatesEnabled(True)
+        self.viewport().update()
+
     def set_pes_view(self, enabled: bool) -> None:
         """Switch to PES view (only PUSI=1 frame-start packets)."""
+        self.setUpdatesEnabled(False)
+
         if enabled:
             self._source_model.set_column_mode("standard")
             self._apply_column_widths(COLUMNS)
-            self._proxy_model.set_pes_view(True)
+            # Use source model's PES mode (pre-built index, instant switch)
+            self._source_model.set_pes_mode(True)
+            self._proxy_model.set_pes_view(False)  # Disable proxy filter (not needed)
         else:
+            self._source_model.set_pes_mode(False)
             self._proxy_model.set_pes_view(False)
+
+        self.setUpdatesEnabled(True)
+        self.viewport().update()
 
     def currentChanged(self, current: QModelIndex, previous: QModelIndex):
         """Handle row selection change."""

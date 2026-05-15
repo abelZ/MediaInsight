@@ -3,10 +3,10 @@
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QMenuBar, QMenu, QFileDialog, QInputDialog,
-    QProgressBar, QLabel, QMessageBox,
+    QProgressBar, QLabel, QMessageBox, QApplication,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QActionGroup
 from typing import Optional
 
 from media_analyzer.core.models import PacketInfo, StreamInfo, TagType, NALUInfo
@@ -36,6 +36,9 @@ class MainWindow(QMainWindow):
         self._worker: Optional[ParseWorker] = None
         self._stream_info: Optional[StreamInfo] = None
         self._current_packet: Optional[PacketInfo] = None
+        self._pes_view_active: bool = False
+        self._current_pes_data: Optional[bytes] = None  # Cached PES for NALU click
+        self._format_detected: bool = False  # Whether we've auto-switched view for this file
 
         self._setup_models()
         self._setup_ui()
@@ -74,52 +77,6 @@ class MainWindow(QMainWindow):
     def _setup_menubar(self):
         """Build the menu bar."""
         menubar = self.menuBar()
-        menubar.setStyleSheet("""
-            QMenuBar {
-                background-color: #2d2d3d;
-                color: #ddd;
-                border-bottom: 1px solid #444;
-                padding: 2px;
-            }
-            QMenuBar::item {
-                padding: 4px 10px;
-                border-radius: 3px;
-            }
-            QMenuBar::item:selected {
-                background-color: #4d4d5d;
-            }
-            QMenu {
-                background-color: #2d2d3d;
-                color: #ddd;
-                border: 1px solid #444;
-            }
-            QMenu::item {
-                padding: 5px 30px 5px 20px;
-            }
-            QMenu::item:selected {
-                background-color: #264f78;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: #444;
-                margin: 4px 10px;
-            }
-            QMenu::indicator {
-                width: 14px;
-                height: 14px;
-                margin-left: 4px;
-            }
-            QMenu::indicator:checked {
-                background-color: #264f78;
-                border: 1px solid #77a;
-                border-radius: 2px;
-            }
-            QMenu::indicator:unchecked {
-                background-color: #2d2d3d;
-                border: 1px solid #555;
-                border-radius: 2px;
-            }
-        """)
 
         # --- File Menu ---
         file_menu = menubar.addMenu("File")
@@ -205,12 +162,14 @@ class MainWindow(QMainWindow):
         self._view_pkt_action.setCheckable(True)
         self._view_pkt_action.setShortcut(QKeySequence("Ctrl+Shift+1"))
         self._view_pkt_action.triggered.connect(self._switch_to_pkt_view)
+        self._view_pkt_action.setEnabled(False)  # Disabled until TS file detected
         view_menu.addAction(self._view_pkt_action)
 
         self._view_pes_action = QAction("TS PES View", self)
         self._view_pes_action.setCheckable(True)
         self._view_pes_action.setShortcut(QKeySequence("Ctrl+Shift+2"))
         self._view_pes_action.triggered.connect(self._switch_to_pes_view)
+        self._view_pes_action.setEnabled(False)  # Disabled until TS file detected
         view_menu.addAction(self._view_pes_action)
 
         self._view_standard_action = QAction("Standard View", self)
@@ -220,19 +179,12 @@ class MainWindow(QMainWindow):
         self._view_standard_action.triggered.connect(self._switch_to_standard_view)
         view_menu.addAction(self._view_standard_action)
 
+        # --- Theme Menu ---
+        self._setup_theme_menu(menubar)
+
     def _setup_statusbar(self):
         """Build the status bar."""
         statusbar = self.statusBar()
-        statusbar.setStyleSheet("""
-            QStatusBar {
-                background-color: #1e1e2e;
-                color: #aaa;
-                border-top: 1px solid #444;
-            }
-            QLabel {
-                padding: 2px 8px;
-            }
-        """)
 
         self._status_label = QLabel("Ready - Open a file or URL to begin analysis")
         statusbar.addWidget(self._status_label, 1)
@@ -243,20 +195,46 @@ class MainWindow(QMainWindow):
         self._progress_bar = QProgressBar()
         self._progress_bar.setMaximumWidth(200)
         self._progress_bar.setMaximumHeight(16)
-        self._progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #444;
-                border-radius: 3px;
-                text-align: center;
-                background-color: #2d2d3d;
-                color: #aaa;
-            }
-            QProgressBar::chunk {
-                background-color: #264f78;
-            }
-        """)
         self._progress_bar.hide()
         statusbar.addPermanentWidget(self._progress_bar)
+
+    def _setup_theme_menu(self, menubar):
+        """Build the Theme menu with all built-in themes."""
+        from media_analyzer.ui.themes import BUILTIN_THEMES, get_current_theme
+
+        theme_menu = menubar.addMenu("Theme")
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+
+        current = get_current_theme()
+
+        for name, theme in BUILTIN_THEMES.items():
+            action = QAction(theme.display_name, self)
+            action.setCheckable(True)
+            if theme.name == current.name:
+                action.setChecked(True)
+            action.setData(name)
+            action.triggered.connect(lambda checked, n=name: self._apply_theme(n))
+            theme_group.addAction(action)
+            theme_menu.addAction(action)
+
+    def _apply_theme(self, theme_name: str):
+        """Apply selected theme to the entire application."""
+        from media_analyzer.ui.themes import BUILTIN_THEMES, set_current_theme, generate_stylesheet
+        from media_analyzer.app import apply_theme
+
+        theme = BUILTIN_THEMES.get(theme_name)
+        if theme is None:
+            return
+
+        set_current_theme(theme)
+        app = QApplication.instance()
+        if app:
+            apply_theme(app, theme)
+
+        # Force table model to refresh colors
+        self._table_model.beginResetModel()
+        self._table_model.endResetModel()
 
     def _connect_signals(self):
         """Connect internal signals."""
@@ -332,6 +310,7 @@ class MainWindow(QMainWindow):
         self._view_pkt_action.setChecked(True)
         self._view_pes_action.setChecked(False)
         self._view_standard_action.setChecked(False)
+        self._pes_view_active = False
         self._table_view.set_ts_pkt_view(True)
 
     def _switch_to_pes_view(self):
@@ -339,6 +318,7 @@ class MainWindow(QMainWindow):
         self._view_pkt_action.setChecked(False)
         self._view_pes_action.setChecked(True)
         self._view_standard_action.setChecked(False)
+        self._pes_view_active = True
         self._table_view.set_pes_view(True)
 
     def _switch_to_standard_view(self):
@@ -346,6 +326,7 @@ class MainWindow(QMainWindow):
         self._view_pkt_action.setChecked(False)
         self._view_pes_action.setChecked(False)
         self._view_standard_action.setChecked(True)
+        self._pes_view_active = False
         self._table_view.set_ts_pkt_view(False)
         self._table_view.set_pes_view(False)
 
@@ -362,6 +343,7 @@ class MainWindow(QMainWindow):
         self._table_model.clear()
         self._detail_panel.clear()
         self._hex_view.clear()
+        self._format_detected = False
 
         # Update UI state
         self._progress_bar.setValue(0)
@@ -369,6 +351,14 @@ class MainWindow(QMainWindow):
         self._stop_action.setEnabled(True)
         self._status_label.setText(f"Parsing: {source.name}...")
         self._info_label.setText("")
+
+        # Reset view state for new file
+        self._view_pkt_action.setEnabled(False)
+        self._view_pes_action.setEnabled(False)
+        self._view_pkt_action.setChecked(False)
+        self._view_pes_action.setChecked(False)
+        self._view_standard_action.setChecked(True)
+        self._pes_view_active = False
 
         # Start worker thread
         self._worker = ParseWorker(source, self)
@@ -380,6 +370,20 @@ class MainWindow(QMainWindow):
 
     def _on_packets_ready(self, packets):
         """Handle batch of parsed packets from worker."""
+        # Early format detection: switch to TS view on first batch if it's a TS stream
+        if not self._format_detected and packets:
+            self._format_detected = True
+            first_pkt = packets[0]
+            if first_pkt.script_data and "pid" in first_pkt.script_data:
+                # TS stream detected — enable TS view actions and switch to packet view
+                self._view_pkt_action.setEnabled(True)
+                self._view_pes_action.setEnabled(True)
+                self._switch_to_pkt_view()
+            else:
+                # Non-TS (FLV etc.) — disable TS-specific view options
+                self._view_pkt_action.setEnabled(False)
+                self._view_pes_action.setEnabled(False)
+
         # Temporarily disable view updates for performance
         self._table_view.setUpdatesEnabled(False)
         self._table_model.append_packets(packets)
@@ -388,10 +392,6 @@ class MainWindow(QMainWindow):
         # Update status (lightweight — just show count)
         count = self._table_model.packet_count
         self._status_label.setText(f"{count:,} tags loaded")
-
-        # Process pending user events (clicks, keyboard) to keep UI interactive
-        from PySide6.QtWidgets import QApplication
-        QApplication.processEvents()
 
     def _on_progress(self, current: int, total: int):
         """Update progress bar."""
@@ -429,12 +429,6 @@ class MainWindow(QMainWindow):
         # Update window title
         self.setWindowTitle(f"Media Analyzer - {stream_info.source_path}")
 
-        # Auto-switch view based on format
-        if stream_info.format_name == "MPEG-TS":
-            self._switch_to_pkt_view()
-        else:
-            self._switch_to_standard_view()
-
     def _on_parse_error(self, error_msg: str):
         """Handle parsing error."""
         self._progress_bar.hide()
@@ -448,28 +442,52 @@ class MainWindow(QMainWindow):
     def _on_packet_selected(self, packet: PacketInfo):
         """Handle packet row selection - update detail and hex panels."""
         self._current_packet = packet
+        self._current_pes_data = None  # Reset cached PES data
 
         # Update detail panel
         self._detail_panel.show_packet(packet)
 
-        # Load hex data for this tag
-        self._show_tag_hex(packet)
+        # Load hex data: PES mode shows full PES, otherwise single TS packet/tag
+        if self._pes_view_active and packet.script_data and packet.script_data.get("pusi"):
+            self._show_pes_hex(packet)
+        else:
+            self._show_tag_hex(packet)
 
     def _on_nalu_selected(self, nalu: NALUInfo, packet: PacketInfo):
         """Handle NALU item click in detail panel - show NALU bytes in hex view."""
         if self._worker and self._worker.source:
             try:
-                # NALU absolute offset in file:
-                #   packet.offset = tag start (including 11-byte tag header)
-                #   +11 = skip tag header
-                #   +nalu.offset_in_tag = offset within tag data to the length prefix
-                # The offset_in_tag already includes the 5-byte AVC header (frametype+codec+avcpkttype+cts)
-                # and points to the length prefix of this NALU
-                abs_offset = packet.offset + 11 + nalu.offset_in_tag
-                # Read: 4-byte length prefix + NALU data
-                read_size = min(4 + nalu.size, 4096)
-                raw = self._worker.source.read_range(abs_offset, read_size)
-                self._hex_view.set_data(raw, abs_offset)
+                if self._pes_view_active and self._current_pes_data:
+                    # PES view: NALU offset is within ES data
+                    # ES starts at _es_offset_in_pes within the PES data
+                    es_offset = packet.script_data.get("_es_offset_in_pes", 0) if packet.script_data else 0
+                    nalu_start_in_pes = es_offset + nalu.offset_in_tag
+                    # Read NALU: start_code + nalu_data
+                    # Detect start code length (3 or 4 bytes)
+                    sc_len = 3
+                    if (nalu_start_in_pes >= 1 and
+                        nalu_start_in_pes + 3 < len(self._current_pes_data) and
+                        self._current_pes_data[nalu_start_in_pes] == 0 and
+                        self._current_pes_data[nalu_start_in_pes + 1] == 0 and
+                        self._current_pes_data[nalu_start_in_pes + 2] == 0):
+                        sc_len = 4
+
+                    # Include start code + nalu data
+                    nalu_total = sc_len + nalu.size
+                    read_size = min(nalu_total, 4096)
+                    raw = self._current_pes_data[nalu_start_in_pes:nalu_start_in_pes + read_size]
+                    # Display offset relative to PES start
+                    self._hex_view.set_data(raw, nalu_start_in_pes)
+                else:
+                    # FLV mode: NALU offset in tag
+                    # packet.offset = tag start (including 11-byte tag header)
+                    # +11 = skip tag header
+                    # +nalu.offset_in_tag = offset within tag data to the length prefix
+                    abs_offset = packet.offset + 11 + nalu.offset_in_tag
+                    # Read: 4-byte length prefix + NALU data
+                    read_size = min(4 + nalu.size, 4096)
+                    raw = self._worker.source.read_range(abs_offset, read_size)
+                    self._hex_view.set_data(raw, abs_offset)
             except Exception:
                 self._hex_view.clear()
 
@@ -483,6 +501,79 @@ class MainWindow(QMainWindow):
                 self._hex_view.clear_highlight()
             except Exception:
                 self._hex_view.clear()
+
+    def _show_pes_hex(self, packet: PacketInfo):
+        """Load full reassembled PES bytes into the hex view (PES view mode)."""
+        if self._worker and self._worker.source:
+            try:
+                pes_bytes = self._read_pes_from_source(packet)
+                if pes_bytes:
+                    self._current_pes_data = pes_bytes
+                    self._hex_view.set_data(pes_bytes, packet.offset)
+                    self._hex_view.clear_highlight()
+                else:
+                    # Fallback to single TS packet
+                    self._show_tag_hex(packet)
+            except Exception:
+                self._hex_view.clear()
+
+    def _read_pes_from_source(self, packet: PacketInfo) -> Optional[bytes]:
+        """
+        Reconstruct full PES data by reading consecutive TS packets from file.
+
+        Starts at packet.offset, reads TS packets for the same PID,
+        strips TS headers, concatenates payloads until the next PUSI=1.
+        """
+        if not self._worker or not self._worker.source:
+            return None
+
+        source = self._worker.source
+        pid = packet.stream_id
+        if pid is None or pid == 0:
+            return None
+
+        pes_data = bytearray()
+        offset = packet.offset
+        max_packets = 512  # Safety limit (~96KB of payload)
+        first = True
+
+        for _ in range(max_packets):
+            try:
+                raw = source.read_range(offset, 188)
+            except Exception:
+                break
+            if len(raw) < 188 or raw[0] != 0x47:
+                break
+
+            # Parse TS header
+            b1, b2, b3 = raw[1], raw[2], raw[3]
+            pkt_pusi = (b1 >> 6) & 0x01
+            pkt_pid = ((b1 & 0x1F) << 8) | b2
+            afc = (b3 >> 4) & 0x03
+
+            # Skip packets for other PIDs
+            if pkt_pid != pid:
+                offset += 188
+                continue
+
+            # If we hit a new PUSI (not the first one), PES is complete
+            if pkt_pusi and not first:
+                break
+            first = False
+
+            # Extract payload
+            payload_offset = 4
+            if afc & 0x02:  # Adaptation field present
+                af_len = raw[4]
+                payload_offset = 5 + af_len
+
+            has_payload = (afc & 0x01) != 0
+            if has_payload and payload_offset < 188:
+                pes_data.extend(raw[payload_offset:188])
+
+            offset += 188
+
+        return bytes(pes_data) if pes_data else None
 
     def _on_field_byte_range(self, offset: int, length: int):
         """Handle detail field click — highlight corresponding bytes in hex view."""

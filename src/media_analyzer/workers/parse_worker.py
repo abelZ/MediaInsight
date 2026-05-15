@@ -13,9 +13,11 @@ from media_analyzer.parsers.ts.parser import TSParser
 # Emit packets to UI in batches for efficiency
 BATCH_SIZE = 2000
 # Minimum interval between UI updates (ms) to avoid overwhelming the event loop
-MIN_EMIT_INTERVAL_MS = 80
+MIN_EMIT_INTERVAL_MS = 150
 # First batch emits sooner so user sees content immediately
 FIRST_BATCH_SIZE = 50
+# Sleep after emit to give UI thread time to paint + handle user input
+YIELD_MS = 10
 
 
 class ParseWorker(QThread):
@@ -82,8 +84,8 @@ class ParseWorker(QThread):
                     batch.clear()
                     first_batch_sent = True
                     last_emit_time = timer.elapsed()
-                    # Yield to UI thread so it can process this batch
-                    QThread.msleep(1)
+                    # Yield to UI thread so it can paint the first rows
+                    QThread.msleep(YIELD_MS)
                     continue
 
                 # Subsequent batches: emit when full OR enough time has passed
@@ -100,8 +102,8 @@ class ParseWorker(QThread):
                             total_size
                         )
 
-                    # Brief yield to let UI process the batch
-                    QThread.msleep(1)
+                    # Yield to UI thread for painting + user interaction
+                    QThread.msleep(YIELD_MS)
 
             # Emit remaining packets
             if batch and self._running:

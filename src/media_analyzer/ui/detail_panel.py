@@ -43,7 +43,6 @@ class DetailPanelWidget(QWidget):
         self._title = QLabel("Tag Details")
         self._title.setStyleSheet("""
             QLabel {
-                color: #aaa;
                 font-weight: bold;
                 font-size: 11px;
                 padding: 2px;
@@ -58,27 +57,6 @@ class DetailPanelWidget(QWidget):
         self._tree.setAlternatingRowColors(True)
         self._tree.setRootIsDecorated(True)
         self._tree.setAnimated(False)
-        self._tree.setStyleSheet("""
-            QTreeWidget {
-                background-color: #1e1e2e;
-                color: #d4d4d4;
-                border: 1px solid #333;
-                alternate-background-color: #252535;
-            }
-            QTreeWidget::item {
-                padding: 2px;
-            }
-            QTreeWidget::item:selected {
-                background-color: #264f78;
-            }
-            QHeaderView::section {
-                background-color: #2d2d3d;
-                color: #aaa;
-                padding: 4px;
-                border: 1px solid #333;
-                font-weight: bold;
-            }
-        """)
         layout.addWidget(self._tree)
 
         # Connect tree item click
@@ -209,6 +187,126 @@ class DetailPanelWidget(QWidget):
 
     def _show_ts_packet_details(self, packet: PacketInfo) -> None:
         """Display TS packet header fields and PES info if present."""
+        d = packet.script_data
+
+        # If this is a video PUSI packet with PES data (back-annotated) → show PES-level view
+        # PES view shows PES/ES layer details with optional NALU breakdown
+        if (d.get("pusi") and packet.tag_type == TagType.VIDEO and
+                (d.get("_pes_size") or packet.nalu_list)):
+            self._show_pes_details(packet)
+            return
+
+        # Standard TS packet view
+        self._show_ts_pkt_detail_standard(packet)
+
+    def _show_pes_details(self, packet: PacketInfo) -> None:
+        """Display PES-level detail: PES header + ES layer + NALU tree."""
+        d = packet.script_data
+        pes = d.get("pes", {})
+
+        # --- PES Header section ---
+        pes_hdr_item = QTreeWidgetItem(self._tree, ["PES Header", ""])
+        pes_hdr_item.setExpanded(True)
+
+        self._add_field(pes_hdr_item, "Stream ID",
+                       pes.get("stream_id_hex", f"0x{pes.get('stream_id', 0):02X}"))
+        self._add_field(pes_hdr_item, "PES Packet Length",
+                       f"{pes.get('pes_packet_length', 0)} bytes")
+        self._add_field(pes_hdr_item, "PES Header Data Length",
+                       str(pes.get("pes_header_data_length", 0)))
+
+        if pes.get("data_alignment"):
+            self._add_field(pes_hdr_item, "Data Alignment", "Yes")
+        if pes.get("priority"):
+            self._add_field(pes_hdr_item, "PES Priority", "Yes")
+
+        # Timing
+        if "pts_ms" in pes:
+            pts_ms = pes["pts_ms"]
+            pts_raw = pes.get("pts", 0)
+            self._add_field(pes_hdr_item, "PTS",
+                           f"{pts_ms} ms (raw: {pts_raw})")
+        if "dts_ms" in pes:
+            dts_ms = pes["dts_ms"]
+            dts_raw = pes.get("dts", 0)
+            self._add_field(pes_hdr_item, "DTS",
+                           f"{dts_ms} ms (raw: {dts_raw})")
+        if "cts_ms" in pes:
+            self._add_field(pes_hdr_item, "CTS (PTS-DTS)",
+                           f"{pes['cts_ms']} ms")
+
+        # PES size info
+        pes_size = d.get("_pes_size", 0)
+        if pes_size:
+            self._add_field(pes_hdr_item, "Total PES Size",
+                           f"{pes_size:,} bytes")
+
+        # --- Elementary Stream section ---
+        es_item = QTreeWidgetItem(self._tree, ["Elementary Stream", ""])
+        es_item.setExpanded(True)
+
+        stream_type = d.get("stream_type", 0)
+        stream_type_name = d.get("stream_type_name", "Unknown")
+        self._add_field(es_item, "Stream Type",
+                       f"0x{stream_type:02X} ({stream_type_name})")
+
+        if packet.video_codec:
+            self._add_field(es_item, "Codec", packet.video_codec.name)
+        if packet.frame_type:
+            self._add_field(es_item, "Frame Type", packet.frame_label)
+
+        # ES size
+        es_offset = d.get("_es_offset_in_pes", 0)
+        if pes_size and es_offset:
+            es_size = pes_size - es_offset
+            self._add_field(es_item, "ES Size", f"{es_size:,} bytes")
+
+        # Keyframe indicator
+        if pes.get("is_keyframe"):
+            self._add_field(es_item, "Keyframe", "Yes (IDR/RAP)")
+
+        # --- NALU list ---
+        if packet.nalu_list:
+            nalu_root = QTreeWidgetItem(self._tree,
+                                        ["NALUs", f"{len(packet.nalu_list)} unit(s)"])
+            nalu_root.setExpanded(True)
+
+            for nalu in packet.nalu_list:
+                nalu_item = QTreeWidgetItem(nalu_root,
+                    [f"NALU #{nalu.index}",
+                     f"{nalu.nalu_type_name} ({nalu.size:,} bytes)"])
+                nalu_item.setExpanded(False)
+                nalu_item.setData(0, NALU_DATA_ROLE, nalu)
+
+                # NALU sub-fields
+                self._add_field(nalu_item, "Type",
+                                f"{nalu.nalu_type_name} (type={nalu.nalu_type})")
+                self._add_field(nalu_item, "Size", f"{nalu.size:,} bytes")
+                self._add_field(nalu_item, "Offset in ES", f"+{nalu.offset_in_tag}")
+                self._add_field(nalu_item, "VCL",
+                                "Yes" if nalu.is_vcl else "No (non-VCL)")
+                if nalu.header_bytes:
+                    hex_str = " ".join(f"{b:02X}" for b in nalu.header_bytes)
+                    self._add_field(nalu_item, "Header Bytes", hex_str)
+
+                # Parsed fields (SPS/PPS/VPS)
+                if nalu.parsed_fields:
+                    parsed_item = QTreeWidgetItem(nalu_item,
+                        ["Parsed Fields", f"({len(nalu.parsed_fields)} entries)"])
+                    parsed_item.setExpanded(True)
+                    self._add_parsed_entries(parsed_item, nalu.parsed_fields)
+
+        # --- Source TS packet info ---
+        ts_info = QTreeWidgetItem(self._tree, ["Source TS Packet", ""])
+        ts_info.setExpanded(False)
+        self._add_field(ts_info, "File Offset",
+                       f"0x{packet.offset:08X} ({packet.offset:,})")
+        self._add_field(ts_info, "PID", f"{d.get('pid', 0)} ({d.get('pid_hex', '')})")
+        self._add_field(ts_info, "Continuity Counter",
+                       str(d.get("continuity_counter", 0)))
+
+    def _show_ts_pkt_detail_standard(self, packet: PacketInfo) -> None:
+        """Display standard TS packet header fields (non-PES view)."""
         d = packet.script_data
 
         # TS Header section
