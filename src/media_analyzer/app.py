@@ -35,10 +35,17 @@ def create_application(argv=None) -> QApplication:
 def _set_app_icon(app: QApplication) -> None:
     """Set application icon from resources. Works on Windows, macOS, and Linux."""
     import os
+    import sys
     from PySide6.QtGui import QIcon, QPixmap
 
-    # Find icon relative to this file's location
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # Find icon directory — handle both normal and PyInstaller frozen mode
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        base_dir = sys._MEIPASS
+    else:
+        # Running from source
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     icon_dir = os.path.join(base_dir, "resources", "icons")
 
     icon = QIcon()

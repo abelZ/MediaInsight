@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QMenuBar, QMenu, QFileDialog, QInputDialog,
     QProgressBar, QLabel, QMessageBox, QApplication,
+    QStackedWidget, QTabBar,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence, QActionGroup
@@ -40,6 +41,7 @@ class MainWindow(QMainWindow):
         self._current_pes_data: Optional[bytes] = None  # Cached PES for NALU click
         self._format_detected: bool = False  # Whether we've auto-switched view for this file
         self._box_tree_view = None  # MP4 box tree widget (created on demand)
+        self._current_file_path: Optional[str] = None  # Current file path for player page
 
         self._setup_models()
         self._setup_ui()
@@ -52,9 +54,34 @@ class MainWindow(QMainWindow):
         self._table_model = PacketTableModel(self)
 
     def _setup_ui(self):
-        """Build the main UI layout."""
-        # Main horizontal splitter: table | detail panel
+        """Build the main UI layout with navigation bar and stacked pages."""
+        # Central container: nav bar + stacked pages
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+
+        # Navigation tab bar
+        self._nav_bar = QTabBar()
+        self._nav_bar.addTab("Analyzer")
+        self._nav_bar.addTab("Player")
+        self._nav_bar.setExpanding(False)
+        self._nav_bar.setDrawBase(False)
+        self._nav_bar.currentChanged.connect(self._on_nav_changed)
+        central_layout.addWidget(self._nav_bar)
+
+        # Stacked widget for pages
+        self._pages = QStackedWidget()
+        central_layout.addWidget(self._pages, 1)
+
+        # --- Page 0: Analyzer (existing layout) ---
+        analyzer_page = QWidget()
+        analyzer_layout = QVBoxLayout(analyzer_page)
+        analyzer_layout.setContentsMargins(0, 0, 0, 0)
+        analyzer_layout.setSpacing(0)
+
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter = main_splitter
 
         # Left: packet table
         self._table_view = PacketTableView(self._table_model)
@@ -73,7 +100,15 @@ class MainWindow(QMainWindow):
         main_splitter.addWidget(right_splitter)
         main_splitter.setSizes([800, 450])
 
-        self.setCentralWidget(main_splitter)
+        analyzer_layout.addWidget(main_splitter)
+        self._pages.addWidget(analyzer_page)
+
+        # --- Page 1: Player (lazy-loaded) ---
+        self._player_page = None
+        player_placeholder = QWidget()  # Placeholder until first use
+        self._pages.addWidget(player_placeholder)
+
+        self.setCentralWidget(central)
 
     def _setup_menubar(self):
         """Build the menu bar."""
@@ -183,6 +218,27 @@ class MainWindow(QMainWindow):
         # --- Theme Menu ---
         self._setup_theme_menu(menubar)
 
+        # --- Help Menu ---
+        help_menu = menubar.addMenu("Help")
+
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    def _show_about(self):
+        """Show about dialog."""
+        QMessageBox.about(
+            self,
+            "About MediaInsight",
+            "<h3>MediaInsight</h3>"
+            "<p>A cross-platform media analysis tool.</p>"
+            "<p>Supports FLV, MPEG-TS, MP4/MOV format parsing at raw byte level.</p>"
+            "<hr>"
+            "<p><b>Developer:</b> Abel</p>"
+            "<p><b>Email:</b> fylaotou@gmail.com</p>"
+            "<p><b>Version:</b> 0.1.0</p>"
+        )
+
     def _setup_statusbar(self):
         """Build the status bar."""
         statusbar = self.statusBar()
@@ -254,6 +310,7 @@ class MainWindow(QMainWindow):
             "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;All Files (*)"
         )
         if path:
+            self._current_file_path = path
             source = FileSource(path)
             self._start_parsing(source)
 
@@ -304,6 +361,30 @@ class MainWindow(QMainWindow):
         self._filter_idr_action.setChecked(False)
         self._filter_sei_action.setChecked(False)
 
+    # --- Navigation ---
+
+    def _on_nav_changed(self, index: int):
+        """Handle navigation tab change."""
+        if index == 1:
+            # Player page — lazy load
+            self._ensure_player_page()
+            # If we have a file loaded, pass it to the player
+            if self._player_page and self._current_file_path:
+                self._player_page.load_file(self._current_file_path)
+        self._pages.setCurrentIndex(index)
+
+    def _ensure_player_page(self):
+        """Create the player page on first use."""
+        if self._player_page is not None:
+            return
+        from media_analyzer.ui.player_page import PlayerPage
+        self._player_page = PlayerPage()
+        # Replace placeholder at index 1
+        old = self._pages.widget(1)
+        self._pages.removeWidget(old)
+        old.deleteLater()
+        self._pages.addWidget(self._player_page)
+
     # --- View Switching ---
 
     def _switch_to_pkt_view(self):
@@ -342,9 +423,8 @@ class MainWindow(QMainWindow):
         self._box_tree_view.box_selected.connect(self._on_packet_selected)
 
         # Hide table, show tree in the same splitter position
-        splitter = self.centralWidget()
         self._table_view.hide()
-        splitter.insertWidget(0, self._box_tree_view)
+        self._main_splitter.insertWidget(0, self._box_tree_view)
 
     def _swap_to_table_view(self):
         """Restore the table view (when switching from MP4 back to FLV/TS)."""
@@ -647,4 +727,6 @@ class MainWindow(QMainWindow):
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(3000)
+        if self._player_page:
+            self._player_page.cleanup()
         event.accept()

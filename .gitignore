@@ -1,1 +1,9 @@
 __pycache__
+build
+dist
+pycache
+*.png
+*.mp4
+*.ts
+*.flv
+.claude
