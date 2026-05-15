@@ -8,6 +8,7 @@ from media_analyzer.core.source import DataSource
 from media_analyzer.parsers.base import BaseParser
 from media_analyzer.parsers.flv.parser import FLVParser
 from media_analyzer.parsers.ts.parser import TSParser
+from media_analyzer.parsers.mp4.parser import MP4Parser
 
 
 # Emit packets to UI in batches for efficiency
@@ -61,6 +62,8 @@ class ParseWorker(QThread):
                 self._parser = FLVParser()
             elif TSParser.sniff(header_peek):
                 self._parser = TSParser()
+            elif MP4Parser.sniff(header_peek):
+                self._parser = MP4Parser()
             else:
                 self.error.emit(f"Unsupported format (magic: {header_peek[:4].hex()})")
                 return

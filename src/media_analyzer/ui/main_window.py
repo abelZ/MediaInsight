@@ -39,6 +39,7 @@ class MainWindow(QMainWindow):
         self._pes_view_active: bool = False
         self._current_pes_data: Optional[bytes] = None  # Cached PES for NALU click
         self._format_detected: bool = False  # Whether we've auto-switched view for this file
+        self._box_tree_view = None  # MP4 box tree widget (created on demand)
 
         self._setup_models()
         self._setup_ui()
@@ -250,7 +251,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Media File",
             "",
-            "Media Files (*.flv *.ts *.m2ts);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;All Files (*)"
+            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;All Files (*)"
         )
         if path:
             source = FileSource(path)
@@ -330,6 +331,29 @@ class MainWindow(QMainWindow):
         self._table_view.set_ts_pkt_view(False)
         self._table_view.set_pes_view(False)
 
+    def _swap_to_box_tree_view(self):
+        """Replace the left panel with a box tree view for MP4 files."""
+        from media_analyzer.ui.box_tree_view import BoxTreeView
+
+        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            return  # Already in box tree mode
+
+        self._box_tree_view = BoxTreeView()
+        self._box_tree_view.box_selected.connect(self._on_packet_selected)
+
+        # Hide table, show tree in the same splitter position
+        splitter = self.centralWidget()
+        self._table_view.hide()
+        splitter.insertWidget(0, self._box_tree_view)
+
+    def _swap_to_table_view(self):
+        """Restore the table view (when switching from MP4 back to FLV/TS)."""
+        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            self._box_tree_view.hide()
+            self._box_tree_view.deleteLater()
+            self._box_tree_view = None
+        self._table_view.show()
+
     # --- Parsing ---
 
     def _start_parsing(self, source):
@@ -344,6 +368,9 @@ class MainWindow(QMainWindow):
         self._detail_panel.clear()
         self._hex_view.clear()
         self._format_detected = False
+
+        # Restore table view if previously in box tree mode (MP4)
+        self._swap_to_table_view()
 
         # Update UI state
         self._progress_bar.setValue(0)
@@ -370,24 +397,35 @@ class MainWindow(QMainWindow):
 
     def _on_packets_ready(self, packets):
         """Handle batch of parsed packets from worker."""
-        # Early format detection: switch to TS view on first batch if it's a TS stream
+        # Early format detection: auto-adapt columns and view based on format
         if not self._format_detected and packets:
             self._format_detected = True
             first_pkt = packets[0]
             if first_pkt.script_data and "pid" in first_pkt.script_data:
-                # TS stream detected — enable TS view actions and switch to packet view
+                # TS stream — enable TS view actions and switch to packet view
                 self._view_pkt_action.setEnabled(True)
                 self._view_pes_action.setEnabled(True)
                 self._switch_to_pkt_view()
-            else:
-                # Non-TS (FLV etc.) — disable TS-specific view options
+            elif first_pkt.script_data and "box_type" in first_pkt.script_data:
+                # MP4 — swap to box tree view
                 self._view_pkt_action.setEnabled(False)
                 self._view_pes_action.setEnabled(False)
+                self._swap_to_box_tree_view()
+            else:
+                # FLV — use FLV columns, disable TS-specific view options
+                self._view_pkt_action.setEnabled(False)
+                self._view_pes_action.setEnabled(False)
+                self._table_view.set_flv_view()
 
-        # Temporarily disable view updates for performance
-        self._table_view.setUpdatesEnabled(False)
-        self._table_model.append_packets(packets)
-        self._table_view.setUpdatesEnabled(True)
+        # Route packets to appropriate view
+        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            # MP4 mode: send to box tree view
+            self._box_tree_view.append_packets(packets)
+        else:
+            # FLV/TS mode: send to table model
+            self._table_view.setUpdatesEnabled(False)
+            self._table_model.append_packets(packets)
+            self._table_view.setUpdatesEnabled(True)
 
         # Update status (lightweight — just show count)
         count = self._table_model.packet_count

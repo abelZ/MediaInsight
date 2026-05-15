@@ -8,21 +8,25 @@ from media_analyzer.core.models import PacketInfo, TagType, FrameType, AVCPacket
 
 
 # Column definitions: (header_name, attribute_or_property, width_hint)
-COLUMNS = [
-    ("No.",         "index",            60),
-    ("Type",        "type_label",       70),
-    ("Timestamp",   "timestamp",        90),
-    ("Size",        "data_size",        80),
-    ("Offset",      "offset",           100),
-    ("CTS",         "composition_time", 60),
-    ("DTS",         "dts",              80),
-    ("PTS",         "pts",              80),
-    ("Codec",       "codec_label",      100),
-    ("Frame",       "frame_label",      100),
-    ("Detail",      "detail_label",     200),
+# FLV columns (no PID/CC/PUSI — stream format without transport layer)
+FLV_COLUMNS = [
+    ("No.",         "index",            50),
+    ("Type",        "type_label",       60),
+    ("Timestamp",   "timestamp",        80),
+    ("Size",        "data_size",        70),
+    ("Offset",      "offset",           90),
+    ("CTS",         "composition_time", 50),
+    ("DTS",         "dts",              70),
+    ("PTS",         "pts",              70),
+    ("Codec",       "codec_label",      80),
+    ("Frame",       "frame_label",      60),
+    ("Detail",      "detail_label",     250),
 ]
 
-# Extra columns for TS packet view
+# Standard columns (fallback, same as FLV)
+COLUMNS = FLV_COLUMNS
+
+# TS packet view columns (with transport layer info)
 TS_PKT_COLUMNS = [
     ("No.",         "index",            60),
     ("Type",        "type_label",       70),
@@ -127,10 +131,12 @@ class PacketTableModel(QAbstractTableModel):
         self._pusi_indices: List[int] = []  # Pre-built index of PUSI packet positions
 
     def set_column_mode(self, mode: str) -> None:
-        """Switch column layout. mode: 'standard' or 'ts_pkt'."""
+        """Switch column layout. mode: 'flv', 'ts_pkt', or 'standard'."""
         self.beginResetModel()
         if mode == "ts_pkt":
             self._columns = TS_PKT_COLUMNS
+        elif mode == "flv":
+            self._columns = FLV_COLUMNS
         else:
             self._columns = COLUMNS
         self.endResetModel()

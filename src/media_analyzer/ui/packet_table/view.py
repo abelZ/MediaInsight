@@ -4,7 +4,7 @@ from PySide6.QtWidgets import QTableView, QHeaderView, QAbstractItemView, QAppli
 from PySide6.QtCore import Qt, Signal, QModelIndex, QSortFilterProxyModel
 
 from media_analyzer.core.models import PacketInfo, TagType, FrameType, H264NALUType
-from media_analyzer.ui.packet_table.model import PacketTableModel, COLUMNS, TS_PKT_COLUMNS
+from media_analyzer.ui.packet_table.model import PacketTableModel, COLUMNS, TS_PKT_COLUMNS, FLV_COLUMNS
 
 
 class PacketFilterProxyModel(QSortFilterProxyModel):
@@ -202,6 +202,13 @@ class PacketTableView(QTableView):
         """Apply column width hints."""
         for i, (_, _, width) in enumerate(columns):
             self.setColumnWidth(i, width)
+
+    def set_flv_view(self) -> None:
+        """Switch to FLV view (no TS-specific columns)."""
+        self._source_model.set_column_mode("flv")
+        self._apply_column_widths(FLV_COLUMNS)
+        self._source_model.set_pes_mode(False)
+        self._proxy_model.set_pes_view(False)
 
     def set_ts_pkt_view(self, enabled: bool) -> None:
         """Switch between TS packet view and standard/PES view."""

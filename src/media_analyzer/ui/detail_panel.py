@@ -99,6 +99,11 @@ class DetailPanelWidget(QWidget):
             self._show_ts_packet_details(packet)
             return
 
+        # MP4 box (identified by script_data containing "box_type" key)
+        if packet.script_data and "box_type" in packet.script_data:
+            self._show_mp4_box_details(packet)
+            return
+
         #
         # FLV Tag Header layout (11 bytes):
         #   Byte 0:    TagType
@@ -491,6 +496,106 @@ class DetailPanelWidget(QWidget):
                     ["Descriptors", f"{len(descs)}"])
                 d_item.setExpanded(True)
                 self._show_descriptors(d_item, descs)
+
+    # -------------------------------------------------------------------------
+    # MP4 box detail
+    # -------------------------------------------------------------------------
+
+    def _show_mp4_box_details(self, packet: PacketInfo) -> None:
+        """Display MP4 box details."""
+        d = packet.script_data
+        box_type = d.get("box_type", "????")
+        desc = d.get("description", "")
+
+        # Box header section
+        box_hdr = QTreeWidgetItem(self._tree, ["Box Header", ""])
+        box_hdr.setExpanded(True)
+
+        title = f"{box_type}"
+        if desc:
+            title += f" ({desc})"
+        self._add_field(box_hdr, "Type", title,
+                       byte_range=(4, 4))
+        self._add_field(box_hdr, "Total Size",
+                       f"{packet.tag_total_size:,} bytes",
+                       byte_range=(0, 4))
+        self._add_field(box_hdr, "Payload Size",
+                       f"{packet.data_size:,} bytes")
+        self._add_field(box_hdr, "Offset",
+                       f"0x{packet.offset:08X} ({packet.offset:,})")
+        header_size = d.get("header_size", 8)
+        self._add_field(box_hdr, "Header Size",
+                       f"{header_size} bytes")
+
+        depth = d.get("depth", 0)
+        self._add_field(box_hdr, "Depth", str(depth))
+
+        if d.get("is_container"):
+            self._add_field(box_hdr, "Container", "Yes (has child boxes)")
+
+        # Parsed fields (if available)
+        fields = d.get("fields")
+        if fields:
+            fields_item = QTreeWidgetItem(self._tree, ["Fields", ""])
+            fields_item.setExpanded(True)
+
+            for key, value in fields.items():
+                if isinstance(value, dict):
+                    sub_item = QTreeWidgetItem(fields_item,
+                        [str(key), f"({len(value)} fields)"])
+                    sub_item.setExpanded(False)
+                    for sk, sv in value.items():
+                        if isinstance(sv, dict):
+                            # Nested dict (rare)
+                            nested = QTreeWidgetItem(sub_item,
+                                [str(sk), f"({len(sv)} fields)"])
+                            nested.setExpanded(False)
+                            for nk, nv in sv.items():
+                                self._add_field(nested, str(nk), self._format_value(nv))
+                        else:
+                            self._add_field(sub_item, str(sk), self._format_value(sv))
+                elif isinstance(value, list):
+                    if len(value) > 0 and isinstance(value[0], dict):
+                        # List of dicts — each dict is a collapsible node
+                        sub_item = QTreeWidgetItem(fields_item,
+                            [str(key), f"[{len(value)} entries]"])
+                        sub_item.setExpanded(len(value) <= 3)
+                        for i, entry in enumerate(value[:50]):
+                            if isinstance(entry, dict):
+                                # Each entry is a tree node
+                                entry_label = f"[{i}]"
+                                # Try to give a meaningful summary
+                                summary_keys = [k for k in ("profile_idc", "profile_name",
+                                    "width", "height", "entropy_coding_mode") if k in entry]
+                                if summary_keys:
+                                    summary = ", ".join(f"{k}={entry[k]}" for k in summary_keys[:2])
+                                    entry_label = f"[{i}] ({summary})"
+                                entry_item = QTreeWidgetItem(sub_item,
+                                    [entry_label, f"{len(entry)} fields"])
+                                entry_item.setExpanded(False)
+                                for ek, ev in entry.items():
+                                    self._add_field(entry_item, str(ek), self._format_value(ev))
+                            else:
+                                self._add_field(sub_item, f"[{i}]", str(entry))
+                    elif len(value) <= 20:
+                        # Short list (e.g. compatible_brands, sync_samples)
+                        sub_item = QTreeWidgetItem(fields_item,
+                            [str(key), f"[{len(value)} items]"])
+                        sub_item.setExpanded(True)
+                        for i, v in enumerate(value):
+                            self._add_field(sub_item, f"[{i}]", str(v))
+                    else:
+                        # Long list — show count + first few
+                        sub_item = QTreeWidgetItem(fields_item,
+                            [str(key), f"[{len(value)} items]"])
+                        sub_item.setExpanded(False)
+                        for i, v in enumerate(value[:20]):
+                            self._add_field(sub_item, f"[{i}]", str(v))
+                        if len(value) > 20:
+                            self._add_field(sub_item, "...",
+                                          f"({len(value) - 20} more)")
+                else:
+                    self._add_field(fields_item, str(key), self._format_value(value))
 
     def _show_video_details(self, packet: PacketInfo, tag_hdr: int) -> None:
         """
