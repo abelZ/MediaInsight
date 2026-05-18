@@ -35,12 +35,14 @@ class MainWindow(QMainWindow):
         self.resize(1400, 800)
 
         self._worker: Optional[ParseWorker] = None
+        self._rtmp_worker = None  # RTMPWorker instance (when RTMP active)
         self._stream_info: Optional[StreamInfo] = None
         self._current_packet: Optional[PacketInfo] = None
         self._pes_view_active: bool = False
         self._current_pes_data: Optional[bytes] = None  # Cached PES for NALU click
         self._format_detected: bool = False  # Whether we've auto-switched view for this file
         self._box_tree_view = None  # MP4 box tree widget (created on demand)
+        self._rtmp_view = None  # RTMPDualView widget (created on demand)
         self._current_file_path: Optional[str] = None  # Current file path for player page
 
         self._setup_models()
@@ -69,6 +71,15 @@ class MainWindow(QMainWindow):
         self._nav_bar.setDrawBase(False)
         self._nav_bar.currentChanged.connect(self._on_nav_changed)
         central_layout.addWidget(self._nav_bar)
+
+        # RTMP Control bar (hidden by default, shown during RTMP sessions)
+        from media_analyzer.ui.rtmp_control_bar import RTMPControlBar
+        self._rtmp_control_bar = RTMPControlBar()
+        self._rtmp_control_bar.hide()
+        self._rtmp_control_bar.pause_clicked.connect(self._rtmp_pause)
+        self._rtmp_control_bar.resume_clicked.connect(self._rtmp_resume)
+        self._rtmp_control_bar.disconnect_clicked.connect(self._rtmp_disconnect)
+        central_layout.addWidget(self._rtmp_control_bar)
 
         # Stacked widget for pages
         self._pages = QStackedWidget()
@@ -328,20 +339,28 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QInputDialog, QLineEdit
         dialog = QInputDialog(self)
         dialog.setWindowTitle("Open URL")
-        dialog.setLabelText("Enter stream URL (HTTP/HTTPS):")
-        dialog.setTextValue("http://")
+        dialog.setLabelText("Enter stream URL (HTTP/HTTPS/RTMP):")
+        dialog.setTextValue("rtmp://")
         dialog.setInputMode(QInputDialog.InputMode.TextInput)
         dialog.resize(500, 150)
         ok = dialog.exec()
         url = dialog.textValue()
-        if ok and url and url != "http://":
+        if ok and url and url not in ("http://", "rtmp://"):
             self._current_file_path = url
             self._reset_player_on_new_file()
-            source = StreamingHTTPSource(url)
-            self._start_parsing(source)
+            if url.startswith("rtmp://") or url.startswith("rtmps://"):
+                self._start_rtmp(url)
+            else:
+                source = StreamingHTTPSource(url)
+                self._start_parsing(source)
 
     def _save_as(self):
         """Save downloaded stream content to a local file."""
+        # RTMP mode: export as FLV
+        if self._rtmp_worker or (self._rtmp_view and self._rtmp_view.flv_packet_count > 0):
+            self._save_as_flv()
+            return
+
         from media_analyzer.core.source import StreamingHTTPSource
         if not self._worker:
             return
@@ -366,6 +385,38 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Save Error", str(e))
 
+    def _save_as_flv(self):
+        """Save RTMP stream as FLV file."""
+        # Get payloads from the worker (may be stopped already)
+        payloads = []
+        has_video = False
+        has_audio = False
+
+        if self._rtmp_worker:
+            payloads = self._rtmp_worker.flv_payloads
+            has_video = self._rtmp_worker.has_video
+            has_audio = self._rtmp_worker.has_audio
+        elif hasattr(self, '_last_rtmp_payloads'):
+            payloads = self._last_rtmp_payloads
+            has_video = self._last_rtmp_has_video
+            has_audio = self._last_rtmp_has_audio
+
+        if not payloads:
+            QMessageBox.warning(self, "Save As", "No FLV data captured yet.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save As FLV", "stream.flv", "FLV Files (*.flv);;All Files (*)")
+        if path:
+            try:
+                from media_analyzer.core.rtmp.flv_writer import write_flv_file
+                bytes_written = write_flv_file(path, payloads, has_video, has_audio)
+                size_mb = bytes_written / (1024 * 1024)
+                self._status_label.setText(
+                    f"Saved FLV: {path} ({size_mb:.1f} MB, {len(payloads)} tags)")
+            except Exception as e:
+                QMessageBox.warning(self, "Save Error", str(e))
+
     def _stop_parsing(self):
         """Stop the current parsing operation."""
         if self._worker and self._worker.isRunning():
@@ -374,6 +425,138 @@ class MainWindow(QMainWindow):
             self._status_label.setText("Parsing stopped")
             self._stop_action.setEnabled(False)
             self._progress_bar.hide()
+        # Also stop RTMP if active
+        if self._rtmp_worker:
+            self._stop_rtmp()
+            self._stop_action.setEnabled(False)
+            self._status_label.setText("RTMP stopped")
+            self._save_as_action.setEnabled(True)
+
+    # --- RTMP ---
+
+    def _start_rtmp(self, url: str):
+        """Start an RTMP session."""
+        # Stop any existing workers
+        self._stop_rtmp()
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(3000)
+
+        # Clear existing data
+        self._detail_panel.clear()
+        self._hex_view.clear()
+
+        # Swap to RTMP dual view
+        self._swap_to_rtmp_view()
+
+        # Show control bar
+        self._rtmp_control_bar.show()
+        self._rtmp_control_bar.set_state("connecting")
+
+        # Update UI
+        self._stop_action.setEnabled(True)
+        self._save_as_action.setEnabled(False)
+        self._status_label.setText(f"Connecting: {url}")
+
+        # Create and start worker
+        from media_analyzer.workers.rtmp_worker import RTMPWorker
+        self._rtmp_worker = RTMPWorker(url, self)
+        self._rtmp_worker.rtmp_packets_ready.connect(self._on_rtmp_packets)
+        self._rtmp_worker.flv_tags_ready.connect(self._on_flv_tags)
+        self._rtmp_worker.stats_updated.connect(self._on_rtmp_stats)
+        self._rtmp_worker.state_changed.connect(self._on_rtmp_state)
+        self._rtmp_worker.error.connect(self._on_parse_error)
+        self._rtmp_worker.start()
+
+    def _stop_rtmp(self):
+        """Stop RTMP session and clean up."""
+        if self._rtmp_worker:
+            # Preserve payloads for Save As after disconnect
+            self._last_rtmp_payloads = self._rtmp_worker.flv_payloads
+            self._last_rtmp_has_video = self._rtmp_worker.has_video
+            self._last_rtmp_has_audio = self._rtmp_worker.has_audio
+            self._rtmp_worker.stop()
+            self._rtmp_worker.wait(3000)
+            self._rtmp_worker = None
+        self._rtmp_control_bar.set_state("disconnected")
+
+    def _rtmp_pause(self):
+        """Pause RTMP data reception."""
+        if self._rtmp_worker:
+            self._rtmp_worker.pause()
+
+    def _rtmp_resume(self):
+        """Resume RTMP data reception."""
+        if self._rtmp_worker:
+            self._rtmp_worker.resume()
+
+    def _rtmp_disconnect(self):
+        """Disconnect RTMP session."""
+        self._stop_rtmp()
+        self._stop_action.setEnabled(False)
+        self._status_label.setText("RTMP disconnected")
+        # Enable Save As if we have FLV data
+        if self._rtmp_worker is None and hasattr(self, '_rtmp_view') and self._rtmp_view:
+            self._save_as_action.setEnabled(True)
+
+    def _on_rtmp_packets(self, packets):
+        """Handle RTMP protocol packets from worker."""
+        if self._rtmp_view:
+            self._rtmp_view.append_rtmp_packets(packets)
+
+    def _on_flv_tags(self, packets):
+        """Handle FLV tags extracted from RTMP stream."""
+        if self._rtmp_view:
+            self._rtmp_view.append_flv_tags(packets)
+
+    def _on_rtmp_stats(self, stats: dict):
+        """Handle RTMP statistics update."""
+        self._rtmp_control_bar.update_stats(stats)
+
+    def _on_rtmp_state(self, state: str):
+        """Handle RTMP state change."""
+        self._rtmp_control_bar.set_state(state)
+        if state == "playing":
+            self._status_label.setText("RTMP: receiving data")
+        elif state == "paused":
+            self._status_label.setText("RTMP: paused")
+        elif state == "disconnected":
+            self._stop_action.setEnabled(False)
+            self._status_label.setText("RTMP: disconnected")
+            # Enable Save As if we have captured FLV payloads
+            self._save_as_action.setEnabled(True)
+        elif state == "error":
+            self._stop_action.setEnabled(False)
+
+    def _swap_to_rtmp_view(self):
+        """Replace the left panel with RTMP dual view."""
+        from media_analyzer.ui.rtmp_view import RTMPDualView
+
+        if self._rtmp_view is not None:
+            self._rtmp_view.clear()
+            return  # Already in RTMP mode
+
+        # Hide box tree if visible
+        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            self._box_tree_view.hide()
+            self._box_tree_view.deleteLater()
+            self._box_tree_view = None
+
+        self._rtmp_view = RTMPDualView()
+        self._rtmp_view.packet_selected.connect(self._on_packet_selected)
+
+        # Hide table, show RTMP view in the same splitter position
+        self._table_view.hide()
+        self._main_splitter.insertWidget(0, self._rtmp_view)
+
+    def _swap_from_rtmp_view(self):
+        """Remove RTMP view and restore normal table."""
+        if self._rtmp_view is not None:
+            self._rtmp_view.hide()
+            self._rtmp_view.deleteLater()
+            self._rtmp_view = None
+        self._table_view.show()
+        self._rtmp_control_bar.hide()
 
     def _apply_filters(self):
         """Apply tag type filters to the table via the proxy model."""
@@ -410,8 +593,12 @@ class MainWindow(QMainWindow):
             self._ensure_player_page()
             # If we have a file loaded, pass it to the player
             if self._player_page and self._current_file_path:
-                source = self._worker.source if self._worker else None
-                self._player_page.load_file(self._current_file_path, source=source)
+                # RTMP mode: generate temp FLV from captured data for playback
+                if self._current_file_path.startswith("rtmp://") or self._current_file_path.startswith("rtmps://"):
+                    self._play_rtmp_as_flv()
+                else:
+                    source = self._worker.source if self._worker else None
+                    self._player_page.load_file(self._current_file_path, source=source)
         self._pages.setCurrentIndex(index)
 
     def _reset_player_on_new_file(self):
@@ -423,6 +610,40 @@ class MainWindow(QMainWindow):
         if self._player_page:
             self._player_page.cleanup()
             self._player_page._loaded = False
+
+    def _play_rtmp_as_flv(self):
+        """Generate temp FLV from RTMP captured data and play it."""
+        import tempfile
+        from media_analyzer.core.rtmp.flv_writer import write_flv_file
+
+        # Get payloads from active worker or saved data
+        payloads = []
+        has_video = False
+        has_audio = False
+
+        if self._rtmp_worker:
+            payloads = self._rtmp_worker.flv_payloads
+            has_video = self._rtmp_worker.has_video
+            has_audio = self._rtmp_worker.has_audio
+        elif hasattr(self, '_last_rtmp_payloads'):
+            payloads = self._last_rtmp_payloads
+            has_video = getattr(self, '_last_rtmp_has_video', True)
+            has_audio = getattr(self, '_last_rtmp_has_audio', True)
+
+        if not payloads:
+            self._status_label.setText("No FLV data captured yet for playback")
+            return
+
+        # Write to temp file
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".flv", delete=False, prefix="mediainsight_rtmp_")
+        tmp.close()
+        write_flv_file(tmp.name, payloads, has_video, has_audio)
+
+        # Play the local temp file (MediaInfo + player both use local path)
+        self._player_page.load_file(tmp.name)
+        self._status_label.setText(
+            f"Playing RTMP capture ({len(payloads)} tags)")
 
     def _ensure_player_page(self):
         """Create the player page on first use."""
@@ -493,6 +714,10 @@ class MainWindow(QMainWindow):
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(3000)
+
+        # Stop RTMP if active
+        self._stop_rtmp()
+        self._swap_from_rtmp_view()
 
         # Clear existing data
         self._table_model.clear()
@@ -637,14 +862,37 @@ class MainWindow(QMainWindow):
         # Update detail panel
         self._detail_panel.show_packet(packet)
 
-        # Load hex data: PES mode shows full PES, otherwise single TS packet/tag
-        if self._pes_view_active and packet.script_data and packet.script_data.get("pusi"):
+        # Load hex data
+        if self._rtmp_worker and self._rtmp_view:
+            # RTMP mode: read hex from worker's stored raw bytes
+            self._show_rtmp_hex(packet)
+        elif self._pes_view_active and packet.script_data and packet.script_data.get("pusi"):
             self._show_pes_hex(packet)
         else:
             self._show_tag_hex(packet)
 
     def _on_nalu_selected(self, nalu: NALUInfo, packet: PacketInfo):
         """Handle NALU item click in detail panel - show NALU bytes in hex view."""
+        # RTMP mode: read from stored FLV payload bytes
+        if self._rtmp_worker and self._rtmp_view:
+            try:
+                raw = self._rtmp_worker.get_flv_raw_bytes(packet.index)
+                if raw and len(raw) > 11:
+                    # get_flv_raw_bytes returns 11-byte header + payload
+                    # nalu.offset_in_tag is relative to payload start (after header)
+                    nalu_start = 11 + nalu.offset_in_tag
+                    read_size = min(4 + nalu.size, len(raw) - nalu_start)
+                    if read_size > 0:
+                        nalu_data = raw[nalu_start:nalu_start + read_size]
+                        self._hex_view.set_data(nalu_data, nalu_start)
+                    else:
+                        self._hex_view.clear()
+                else:
+                    self._hex_view.clear()
+            except Exception:
+                self._hex_view.clear()
+            return
+
         if self._worker and self._worker.source:
             try:
                 if self._pes_view_active and self._current_pes_data:
@@ -691,6 +939,29 @@ class MainWindow(QMainWindow):
                 self._hex_view.clear_highlight()
             except Exception:
                 self._hex_view.clear()
+
+    def _show_rtmp_hex(self, packet: PacketInfo):
+        """Load hex data for RTMP packet (from worker's stored raw bytes)."""
+        if not self._rtmp_worker:
+            self._hex_view.clear()
+            return
+        try:
+            # Determine which raw bytes to show based on packet type
+            if packet.script_data and "rtmp_message_type" in packet.script_data:
+                # RTMP protocol packet
+                raw = self._rtmp_worker.get_rtmp_raw_bytes(packet.index)
+            else:
+                # FLV tag packet
+                raw = self._rtmp_worker.get_flv_raw_bytes(packet.index)
+
+            if raw:
+                display_size = min(len(raw), 4096)
+                self._hex_view.set_data(raw[:display_size], packet.offset)
+                self._hex_view.clear_highlight()
+            else:
+                self._hex_view.clear()
+        except Exception:
+            self._hex_view.clear()
 
     def _show_pes_hex(self, packet: PacketInfo):
         """Load full reassembled PES bytes into the hex view (PES view mode)."""
@@ -799,6 +1070,9 @@ class MainWindow(QMainWindow):
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(3000)
+        if self._rtmp_worker:
+            self._rtmp_worker.stop()
+            self._rtmp_worker.wait(3000)
         if self._player_page:
             self._player_page.cleanup()
         event.accept()

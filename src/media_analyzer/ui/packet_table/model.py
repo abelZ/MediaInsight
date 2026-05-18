@@ -26,6 +26,18 @@ FLV_COLUMNS = [
 # Standard columns (fallback, same as FLV)
 COLUMNS = FLV_COLUMNS
 
+# RTMP protocol packet view columns
+RTMP_COLUMNS = [
+    ("No.",       "index",             50),
+    ("Dir",       "_direction",        45),
+    ("Type",      "_rtmp_type",       110),
+    ("CSID",      "_csid",            45),
+    ("MsgSID",    "_msg_stream_id",   60),
+    ("Timestamp", "timestamp",         80),
+    ("Size",      "data_size",         70),
+    ("Detail",    "detail_label",     300),
+]
+
 # TS packet view columns (with transport layer info)
 TS_PKT_COLUMNS = [
     ("No.",         "index",            60),
@@ -131,12 +143,14 @@ class PacketTableModel(QAbstractTableModel):
         self._pusi_indices: List[int] = []  # Pre-built index of PUSI packet positions
 
     def set_column_mode(self, mode: str) -> None:
-        """Switch column layout. mode: 'flv', 'ts_pkt', or 'standard'."""
+        """Switch column layout. mode: 'flv', 'ts_pkt', 'rtmp', or 'standard'."""
         self.beginResetModel()
         if mode == "ts_pkt":
             self._columns = TS_PKT_COLUMNS
         elif mode == "flv":
             self._columns = FLV_COLUMNS
+        elif mode == "rtmp":
+            self._columns = RTMP_COLUMNS
         else:
             self._columns = COLUMNS
         self.endResetModel()
@@ -195,9 +209,10 @@ class PacketTableModel(QAbstractTableModel):
         elif role == Qt.ItemDataRole.TextAlignmentRole:
             # Right-align numeric columns
             if col_attr in ("index", "timestamp", "data_size", "offset",
-                           "composition_time", "dts", "pts", "_pid", "_cc"):
+                           "composition_time", "dts", "pts", "_pid", "_cc",
+                           "_csid", "_msg_stream_id"):
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            elif col_attr == "_pusi":
+            elif col_attr in ("_pusi", "_direction"):
                 return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.UserRole:
@@ -292,6 +307,23 @@ class PacketTableModel(QAbstractTableModel):
         elif attr == "_pusi":
             if packet.script_data and "pusi" in packet.script_data:
                 return "1" if packet.script_data["pusi"] else "0"
+            return ""
+        # RTMP-specific virtual columns
+        elif attr == "_direction":
+            if packet.script_data and "direction" in packet.script_data:
+                return packet.script_data["direction"]
+            return ""
+        elif attr == "_rtmp_type":
+            if packet.script_data and "rtmp_message_type" in packet.script_data:
+                return packet.script_data["rtmp_message_type"]
+            return ""
+        elif attr == "_csid":
+            if packet.script_data and "csid" in packet.script_data:
+                return str(packet.script_data["csid"])
+            return ""
+        elif attr == "_msg_stream_id":
+            if packet.script_data and "msg_stream_id" in packet.script_data:
+                return str(packet.script_data["msg_stream_id"])
             return ""
 
         value = getattr(packet, attr, None)

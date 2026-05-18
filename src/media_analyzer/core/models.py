@@ -280,6 +280,25 @@ class PacketInfo:
     def detail_label(self) -> str:
         """Additional detail info for display."""
         parts = []
+
+        # RTMP protocol packet details
+        if self.script_data and "rtmp_message_type" in self.script_data:
+            sd = self.script_data
+            msg_type = sd.get("rtmp_message_type", "")
+            if sd.get("handshake_phase"):
+                parts.append(sd["handshake_phase"])
+            elif sd.get("command_name"):
+                parts.append(sd["command_name"])
+                if sd.get("transaction_id"):
+                    parts.append(f"tid={sd['transaction_id']}")
+            elif sd.get("chunk_size"):
+                parts.append(f"size={sd['chunk_size']}")
+            elif sd.get("window_ack_size"):
+                parts.append(f"size={sd['window_ack_size']}")
+            elif sd.get("event_type"):
+                parts.append(sd["event_type"])
+            return " | ".join(parts)
+
         if self.tag_type == TagType.HEADER:
             if self.header_info:
                 hi = self.header_info

@@ -89,6 +89,11 @@ class DetailPanelWidget(QWidget):
 
         self._title.setText(f"Tag Details - #{packet.index} ({packet.type_label})")
 
+        # RTMP protocol packet (identified by "rtmp_message_type" in script_data)
+        if packet.script_data and "rtmp_message_type" in packet.script_data:
+            self._show_rtmp_packet_details(packet)
+            return
+
         # FLV Header pseudo-tag
         if packet.tag_type == TagType.HEADER:
             self._show_header_details(packet)
@@ -596,6 +601,89 @@ class DetailPanelWidget(QWidget):
                                           f"({len(value) - 20} more)")
                 else:
                     self._add_field(fields_item, str(key), self._format_value(value))
+
+    def _show_rtmp_packet_details(self, packet: PacketInfo) -> None:
+        """Show RTMP protocol packet details."""
+        sd = packet.script_data
+        if not sd:
+            return
+
+        msg_type = sd.get("rtmp_message_type", "Unknown")
+        self._title.setText(f"RTMP - #{packet.index} ({msg_type})")
+
+        # RTMP Message Header
+        header_item = QTreeWidgetItem(self._tree, ["RTMP Message", ""])
+        header_item.setExpanded(True)
+
+        self._add_field(header_item, "Message Type", msg_type)
+        self._add_field(header_item, "Type ID", str(sd.get("rtmp_message_type_id", "")))
+        self._add_field(header_item, "Direction", sd.get("direction", ""))
+        self._add_field(header_item, "Chunk Stream ID", str(sd.get("csid", "")))
+        self._add_field(header_item, "Message Stream ID", str(sd.get("msg_stream_id", "")))
+        self._add_field(header_item, "Timestamp", f"{packet.timestamp} ms")
+        self._add_field(header_item, "Payload Size", f"{packet.data_size} bytes")
+
+        # Handshake details
+        if sd.get("handshake_phase"):
+            hs_item = QTreeWidgetItem(self._tree, ["Handshake", ""])
+            hs_item.setExpanded(True)
+            self._add_field(hs_item, "Phase", sd["handshake_phase"])
+            if "version" in sd:
+                self._add_field(hs_item, "Version", str(sd["version"]))
+            if "c1_time" in sd:
+                self._add_field(hs_item, "C1 Time", str(sd["c1_time"]))
+            if "s1_time" in sd:
+                self._add_field(hs_item, "S1 Time", str(sd["s1_time"]))
+
+        # Protocol control details
+        if "chunk_size" in sd:
+            ctrl_item = QTreeWidgetItem(self._tree, ["Protocol Control", ""])
+            ctrl_item.setExpanded(True)
+            self._add_field(ctrl_item, "New Chunk Size", str(sd["chunk_size"]))
+
+        if "window_ack_size" in sd:
+            ctrl_item = QTreeWidgetItem(self._tree, ["Protocol Control", ""])
+            ctrl_item.setExpanded(True)
+            self._add_field(ctrl_item, "Window Ack Size", str(sd["window_ack_size"]))
+
+        if "window_size" in sd:
+            ctrl_item = QTreeWidgetItem(self._tree, ["Set Peer Bandwidth", ""])
+            ctrl_item.setExpanded(True)
+            self._add_field(ctrl_item, "Window Size", str(sd["window_size"]))
+            limit_types = {0: "Hard", 1: "Soft", 2: "Dynamic"}
+            self._add_field(ctrl_item, "Limit Type",
+                          limit_types.get(sd.get("limit_type", -1), "Unknown"))
+
+        if "event_type" in sd:
+            uc_item = QTreeWidgetItem(self._tree, ["User Control", ""])
+            uc_item.setExpanded(True)
+            self._add_field(uc_item, "Event", sd["event_type"])
+            if "event_stream_id" in sd:
+                self._add_field(uc_item, "Stream ID", str(sd["event_stream_id"]))
+
+        if "sequence_number" in sd:
+            self._add_field(header_item, "Sequence Number", str(sd["sequence_number"]))
+
+        # Command details
+        if "command_name" in sd:
+            cmd_item = QTreeWidgetItem(self._tree, ["Command", ""])
+            cmd_item.setExpanded(True)
+            self._add_field(cmd_item, "Name", sd["command_name"])
+            if "transaction_id" in sd:
+                self._add_field(cmd_item, "Transaction ID", str(sd["transaction_id"]))
+            # AMF objects
+            if "amf_objects" in sd:
+                for i, obj in enumerate(sd["amf_objects"]):
+                    if isinstance(obj, dict):
+                        obj_item = QTreeWidgetItem(cmd_item,
+                            [f"Object [{i}]", f"{{{len(obj)} properties}}"])
+                        obj_item.setExpanded(i == 0)
+                        for key, value in obj.items():
+                            self._add_field(obj_item, str(key), self._format_value(value))
+                    elif obj is None:
+                        self._add_field(cmd_item, f"Arg [{i}]", "null")
+                    else:
+                        self._add_field(cmd_item, f"Arg [{i}]", str(obj))
 
     def _show_video_details(self, packet: PacketInfo, tag_hdr: int) -> None:
         """
