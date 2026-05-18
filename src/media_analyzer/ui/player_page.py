@@ -7,10 +7,27 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QUrl, Signal, QThread
 from PySide6.QtGui import QFont
 from typing import Optional
 import os
+
+
+class _MediaInfoWorker(QThread):
+    """Background thread for pymediainfo parsing (avoids blocking UI)."""
+    finished = Signal(object)  # Emits list of track dicts
+
+    def __init__(self, file_path: str, parent=None):
+        super().__init__(parent)
+        self._file_path = file_path
+
+    def run(self):
+        try:
+            from pymediainfo import MediaInfo
+            media_info = MediaInfo.parse(self._file_path)
+            self.finished.emit(media_info)
+        except Exception as e:
+            self.finished.emit(None)
 
 
 class PlayerPage(QWidget):
@@ -23,6 +40,9 @@ class PlayerPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._file_path: Optional[str] = None
+        self._source = None
+        self._temp_file = None
+        self._loaded = False  # Whether current file is already loaded
         self._setup_ui()
 
     def _setup_ui(self):
@@ -46,6 +66,7 @@ class PlayerPage(QWidget):
         # Player engine
         self._player = QMediaPlayer()
         self._audio_output = QAudioOutput()
+        self._audio_output.setVolume(1.0)  # Full volume by default
         self._player.setAudioOutput(self._audio_output)
         self._player.setVideoOutput(self._video_widget)
 
@@ -104,31 +125,76 @@ class PlayerPage(QWidget):
         self._player.durationChanged.connect(self._on_duration_changed)
         self._player.playbackStateChanged.connect(self._on_state_changed)
 
-    def load_file(self, file_path: str) -> None:
-        """Load a media file for playback and info display."""
-        self._file_path = file_path
+    def load_file(self, file_path: str, source=None) -> None:
+        """Load a media file or URL for playback and info display.
 
-        # Load into player
-        url = QUrl.fromLocalFile(file_path)
+        Args:
+            file_path: Local path or URL
+            source: Optional StreamingHTTPSource — if fully downloaded, play from local buffer
+        """
+        # Skip if already loaded the same file
+        if file_path == self._file_path and self._loaded:
+            return
+
+        self._file_path = file_path
+        self._source = source
+        self._loaded = True
+
+        # Don't set player source here — defer to play button click
+        # This avoids slow temp file writing on tab switch
+
+        # Load MediaInfo in background to avoid blocking UI
+        self._load_mediainfo_async(file_path)
+
+    def _set_player_source(self):
+        """Set the player source — use local temp file if stream is fully downloaded."""
+        file_path = self._file_path
+        if not file_path:
+            return
+
+        from media_analyzer.core.source import StreamingHTTPSource
+        if (self._source and isinstance(self._source, StreamingHTTPSource)
+                and self._source.is_fully_downloaded):
+            # Stream fully downloaded — save to temp file and play locally
+            import tempfile
+            import os
+            ext = os.path.splitext(self._source.name)[1] or ".mp4"
+            if self._temp_file is None:
+                self._temp_file = tempfile.NamedTemporaryFile(
+                    suffix=ext, delete=False, prefix="mediainsight_")
+                self._temp_file.write(
+                    self._source.read_range(0, self._source.downloaded_bytes))
+                self._temp_file.flush()
+                self._temp_file.close()
+            url = QUrl.fromLocalFile(self._temp_file.name)
+        elif file_path.startswith("http://") or file_path.startswith("https://"):
+            url = QUrl(file_path)
+        else:
+            url = QUrl.fromLocalFile(file_path)
+
         self._player.setSource(url)
 
-        # Load MediaInfo
-        self._load_mediainfo(file_path)
+    def _load_mediainfo_async(self, file_path: str) -> None:
+        """Parse MediaInfo in background thread to avoid blocking UI."""
+        self._info_tree.clear()
+        loading_item = QTreeWidgetItem(self._info_tree, ["Loading...", ""])
 
-    def _load_mediainfo(self, file_path: str) -> None:
-        """Parse and display MediaInfo for the file."""
+        # For URL streams with temp file available, use temp file path
+        mediainfo_path = file_path
+        if self._temp_file is not None:
+            mediainfo_path = self._temp_file.name
+
+        self._mediainfo_worker = _MediaInfoWorker(mediainfo_path, self)
+        self._mediainfo_worker.finished.connect(self._on_mediainfo_ready)
+        self._mediainfo_worker.start()
+
+    def _on_mediainfo_ready(self, media_info) -> None:
+        """Handle MediaInfo result from background thread."""
         self._info_tree.clear()
 
-        try:
-            from pymediainfo import MediaInfo
-            media_info = MediaInfo.parse(file_path)
-        except ImportError:
-            item = QTreeWidgetItem(self._info_tree,
-                ["Error", "pymediainfo not installed (pip install pymediainfo)"])
-            return
-        except Exception as e:
-            item = QTreeWidgetItem(self._info_tree,
-                ["Error", str(e)])
+        if media_info is None:
+            QTreeWidgetItem(self._info_tree,
+                ["Error", "Failed to parse media info"])
             return
 
         # Display each track
@@ -212,10 +278,17 @@ class PlayerPage(QWidget):
         if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self._player.pause()
         else:
+            # Ensure player source is set (lazy — first play triggers temp file write)
+            if self._player.source().isEmpty():
+                self._set_player_source()
             self._player.play()
 
     def _stop(self):
+        """Stop playback. Re-set source to allow replay."""
         self._player.stop()
+        # Re-set source for clean replay (avoids FFmpeg seek issues on URLs)
+        self._player.setSource(QUrl())
+        self._set_player_source()
 
     def _seek(self, position: int):
         self._player.setPosition(position)
@@ -258,3 +331,11 @@ class PlayerPage(QWidget):
         """Stop playback and release resources."""
         self._player.stop()
         self._player.setSource(QUrl())
+        # Remove temp file if created
+        if hasattr(self, '_temp_file') and self._temp_file is not None:
+            import os
+            try:
+                os.unlink(self._temp_file.name)
+            except OSError:
+                pass
+            self._temp_file = None

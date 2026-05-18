@@ -35,6 +35,7 @@ class ParseWorker(QThread):
     # Signals
     packets_ready = Signal(list)          # List[PacketInfo]
     progress = Signal(int, int)           # (bytes_processed, total_bytes)
+    download_progress = Signal(int, int)  # (downloaded_bytes, total_bytes)
     parse_finished = Signal(object)       # StreamInfo
     error = Signal(str)                   # Error message
 
@@ -52,6 +53,11 @@ class ParseWorker(QThread):
     def run(self):
         """Main parse loop - runs in background thread."""
         try:
+            # Set up download progress callback for streaming sources
+            from media_analyzer.core.source import StreamingHTTPSource
+            if isinstance(self._source, StreamingHTTPSource):
+                self._source.set_download_callback(self._on_download_progress)
+
             reader = self._source.open()
 
             # Sniff format from first bytes (need enough for TS detection: 2 packets)
@@ -129,3 +135,7 @@ class ParseWorker(QThread):
     def stop(self):
         """Request graceful stop of parsing."""
         self._running = False
+
+    def _on_download_progress(self, downloaded: int, total: int):
+        """Callback from streaming source — emit download progress signal."""
+        self.download_progress.emit(downloaded, total)

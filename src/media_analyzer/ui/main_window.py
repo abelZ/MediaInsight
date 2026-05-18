@@ -129,6 +129,14 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        self._save_as_action = QAction("Save As...", self)
+        self._save_as_action.setShortcut(QKeySequence("Ctrl+S"))
+        self._save_as_action.triggered.connect(self._save_as)
+        self._save_as_action.setEnabled(False)
+        file_menu.addAction(self._save_as_action)
+
+        file_menu.addSeparator()
+
         self._stop_action = QAction("Stop Parsing", self)
         self._stop_action.setShortcut(QKeySequence("Escape"))
         self._stop_action.triggered.connect(self._stop_parsing)
@@ -311,20 +319,52 @@ class MainWindow(QMainWindow):
         )
         if path:
             self._current_file_path = path
+            self._reset_player_on_new_file()
             source = FileSource(path)
             self._start_parsing(source)
 
     def _open_url(self):
         """Open a network stream URL."""
-        url, ok = QInputDialog.getText(
-            self,
-            "Open URL",
-            "Enter stream URL (HTTP/HTTPS):",
-            text="http://"
-        )
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Open URL")
+        dialog.setLabelText("Enter stream URL (HTTP/HTTPS):")
+        dialog.setTextValue("http://")
+        dialog.setInputMode(QInputDialog.InputMode.TextInput)
+        dialog.resize(500, 150)
+        ok = dialog.exec()
+        url = dialog.textValue()
         if ok and url and url != "http://":
+            self._current_file_path = url
+            self._reset_player_on_new_file()
             source = StreamingHTTPSource(url)
             self._start_parsing(source)
+
+    def _save_as(self):
+        """Save downloaded stream content to a local file."""
+        from media_analyzer.core.source import StreamingHTTPSource
+        if not self._worker:
+            return
+        source = self._worker.source
+        if not isinstance(source, StreamingHTTPSource):
+            QMessageBox.information(self, "Save As",
+                "Save As is only available for URL streams.")
+            return
+        if source.downloaded_bytes == 0:
+            QMessageBox.warning(self, "Save As", "No data downloaded yet.")
+            return
+
+        # Suggest filename from URL
+        suggested = source.name or "download.bin"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save As", suggested, "All Files (*)")
+        if path:
+            try:
+                source.save_to_file(path)
+                size_mb = source.downloaded_bytes / (1024 * 1024)
+                self._status_label.setText(f"Saved: {path} ({size_mb:.1f} MB)")
+            except Exception as e:
+                QMessageBox.warning(self, "Save Error", str(e))
 
     def _stop_parsing(self):
         """Stop the current parsing operation."""
@@ -370,8 +410,19 @@ class MainWindow(QMainWindow):
             self._ensure_player_page()
             # If we have a file loaded, pass it to the player
             if self._player_page and self._current_file_path:
-                self._player_page.load_file(self._current_file_path)
+                source = self._worker.source if self._worker else None
+                self._player_page.load_file(self._current_file_path, source=source)
         self._pages.setCurrentIndex(index)
+
+    def _reset_player_on_new_file(self):
+        """Reset player page state when a new file is opened."""
+        # Switch back to Analyzer tab
+        if self._nav_bar.currentIndex() != 0:
+            self._nav_bar.setCurrentIndex(0)
+
+        if self._player_page:
+            self._player_page.cleanup()
+            self._player_page._loaded = False
 
     def _ensure_player_page(self):
         """Create the player page on first use."""
@@ -471,6 +522,7 @@ class MainWindow(QMainWindow):
         self._worker = ParseWorker(source, self)
         self._worker.packets_ready.connect(self._on_packets_ready)
         self._worker.progress.connect(self._on_progress)
+        self._worker.download_progress.connect(self._on_download_progress)
         self._worker.parse_finished.connect(self._on_parse_finished)
         self._worker.error.connect(self._on_parse_error)
         self._worker.start()
@@ -516,6 +568,26 @@ class MainWindow(QMainWindow):
         if total > 0:
             percent = int(current * 100 / total)
             self._progress_bar.setValue(percent)
+
+    def _on_download_progress(self, downloaded: int, total: int):
+        """Update status bar with download progress."""
+        if total > 0:
+            percent = int(downloaded * 100 / total)
+            mb_down = downloaded / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            self._status_label.setText(
+                f"Downloading: {mb_down:.1f} / {mb_total:.1f} MB ({percent}%)")
+            self._progress_bar.setValue(percent)
+            self._progress_bar.show()
+        else:
+            mb_down = downloaded / (1024 * 1024)
+            self._status_label.setText(f"Downloading: {mb_down:.1f} MB...")
+
+        # Enable Save As only when fully downloaded
+        if hasattr(self, '_save_as_action'):
+            from media_analyzer.core.source import StreamingHTTPSource
+            if self._worker and isinstance(self._worker.source, StreamingHTTPSource):
+                self._save_as_action.setEnabled(self._worker.source.is_fully_downloaded)
 
     def _on_parse_finished(self, stream_info: StreamInfo):
         """Handle parsing completion."""

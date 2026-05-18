@@ -222,6 +222,23 @@ class StreamingHTTPSource(DataSource):
         self._buffer = bytearray()
         self._total_size = 0
         self._reader: Optional[_StreamingReader] = None
+        self._download_callback = None  # (downloaded, total) -> None
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    @property
+    def downloaded_bytes(self) -> int:
+        return len(self._buffer)
+
+    @property
+    def is_fully_downloaded(self) -> bool:
+        return self._total_size > 0 and len(self._buffer) >= self._total_size
+
+    def set_download_callback(self, callback) -> None:
+        """Set a callback for download progress: callback(downloaded_bytes, total_bytes)."""
+        self._download_callback = callback
 
     def open(self) -> BinaryIO:
         """Open HTTP connection, return streaming reader."""
@@ -238,7 +255,8 @@ class StreamingHTTPSource(DataSource):
         if content_length:
             self._total_size = int(content_length)
 
-        self._reader = _StreamingReader(self._response, self._buffer)
+        self._reader = _StreamingReader(
+            self._response, self._buffer, self._total_size, self._download_callback)
         return self._reader
 
     def read_range(self, offset: int, size: int) -> bytes:
@@ -247,6 +265,11 @@ class StreamingHTTPSource(DataSource):
         if offset >= len(self._buffer):
             return b""
         return bytes(self._buffer[offset:end])
+
+    def save_to_file(self, path: str) -> None:
+        """Save downloaded buffer to a local file."""
+        with open(path, "wb") as f:
+            f.write(self._buffer)
 
     @property
     def size(self) -> int:
@@ -267,18 +290,35 @@ class StreamingHTTPSource(DataSource):
 class _StreamingReader:
     """File-like reader that buffers network data as it reads."""
 
-    def __init__(self, response, buffer: bytearray):
+    def __init__(self, response, buffer: bytearray, total_size: int = 0, progress_callback=None):
         self._response = response
         self._buffer = buffer
         self._pos = 0
+        self._total_size = total_size  # Known from Content-Length
+        self._progress_callback = progress_callback
+
+    def _fetch(self, min_bytes: int) -> None:
+        """Fetch at least min_bytes from network into buffer."""
+        while min_bytes > 0:
+            chunk = self._response.read(min(min_bytes, 65536))
+            if not chunk:
+                break
+            self._buffer.extend(chunk)
+            min_bytes -= len(chunk)
+            if self._progress_callback:
+                self._progress_callback(len(self._buffer), self._total_size)
 
     def read(self, n: int = -1) -> bytes:
         """Read n bytes, fetching from network as needed."""
         if n == -1:
             # Read all remaining
-            remaining = self._response.read()
-            if remaining:
-                self._buffer.extend(remaining)
+            while True:
+                chunk = self._response.read(65536)
+                if not chunk:
+                    break
+                self._buffer.extend(chunk)
+                if self._progress_callback:
+                    self._progress_callback(len(self._buffer), self._total_size)
             data = bytes(self._buffer[self._pos:])
             self._pos = len(self._buffer)
             return data
@@ -286,9 +326,7 @@ class _StreamingReader:
         # Ensure we have enough data in buffer
         needed = self._pos + n - len(self._buffer)
         if needed > 0:
-            chunk = self._response.read(max(needed, 65536))
-            if chunk:
-                self._buffer.extend(chunk)
+            self._fetch(needed)
 
         available = len(self._buffer) - self._pos
         to_read = min(n, available)
@@ -303,11 +341,26 @@ class _StreamingReader:
         return self._pos
 
     def seek(self, offset: int, whence: int = 0) -> int:
-        if whence == 0:
+        if whence == 2:
+            # Seek from end — use known total size if available
+            if self._total_size > 0:
+                self._pos = self._total_size + offset
+            else:
+                # Must download all to know size
+                while True:
+                    chunk = self._response.read(65536)
+                    if not chunk:
+                        break
+                    self._buffer.extend(chunk)
+                    if self._progress_callback:
+                        self._progress_callback(len(self._buffer), self._total_size)
+                self._pos = len(self._buffer) + offset
+        elif whence == 0:
+            # Seek to absolute position — download enough data if needed
+            if offset > len(self._buffer):
+                self._fetch(offset - len(self._buffer))
             self._pos = offset
         elif whence == 1:
             self._pos += offset
-        elif whence == 2:
-            self._pos = len(self._buffer) + offset
         self._pos = max(0, self._pos)
         return self._pos
