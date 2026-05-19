@@ -471,7 +471,7 @@ class MP4Parser(BaseParser):
         entry_count = struct.unpack(">I", data[4:8])[0]
         entries = []
         pos = 8
-        for _ in range(min(entry_count, 20)):
+        for _ in range(entry_count):
             if pos + 8 > len(data):
                 break
             count = struct.unpack(">I", data[pos:pos+4])[0]
@@ -504,15 +504,17 @@ class MP4Parser(BaseParser):
         sample_count = struct.unpack(">I", data[8:12])[0]
         result: Dict[str, Any] = {"sample_size": sample_size, "sample_count": sample_count}
         if sample_size == 0 and sample_count > 0:
-            # Variable size: read first few entries
+            # Variable size: read all entries
             sizes = []
             pos = 12
-            for _ in range(min(sample_count, 20)):
+            for _ in range(sample_count):
                 if pos + 4 > len(data):
                     break
                 sizes.append(struct.unpack(">I", data[pos:pos+4])[0])
                 pos += 4
-            result["first_sizes"] = sizes
+            result["sizes"] = sizes
+            # Keep first_sizes for backward compat with detail panel display
+            result["first_sizes"] = sizes[:20]
         return result
 
     def _parse_stco(self, data: bytes, is_co64: bool) -> Dict[str, Any]:
@@ -538,7 +540,7 @@ class MP4Parser(BaseParser):
         entry_count = struct.unpack(">I", data[4:8])[0]
         samples = []
         pos = 8
-        for _ in range(min(entry_count, 50)):
+        for _ in range(entry_count):
             if pos + 4 > len(data):
                 break
             samples.append(struct.unpack(">I", data[pos:pos+4])[0])
@@ -1087,7 +1089,7 @@ class MP4Parser(BaseParser):
         if box_type == b'trak':
             # Start a new track
             self._current_track = {"handler": "", "stco": [], "stsz": [],
-                                   "stsc": [], "stss": set()}
+                                   "stsc": [], "stss": set(), "stts": [], "timescale": 0}
             self._tracks.append(self._current_track)
         elif box_type == b'hdlr' and self._current_track is not None:
             # Only set handler if not already set (first hdlr in trak/mdia is correct,
@@ -1162,6 +1164,31 @@ class MP4Parser(BaseParser):
                         break
                     sync.add(struct.unpack(">I", raw[pos:pos+4])[0])
                 self._current_track["stss"] = sync
+        elif box_type == b'stts' and self._current_track is not None:
+            source.seek(payload_offset)
+            raw = source.read(min(payload_size, 131072))
+            if len(raw) >= 8:
+                count = struct.unpack(">I", raw[4:8])[0]
+                entries = []
+                for i in range(count):
+                    pos = 8 + i * 8
+                    if pos + 8 > len(raw):
+                        break
+                    sc = struct.unpack(">I", raw[pos:pos+4])[0]
+                    sd = struct.unpack(">I", raw[pos+4:pos+8])[0]
+                    entries.append((sc, sd))  # (sample_count, sample_delta)
+                self._current_track["stts"] = entries
+        elif box_type == b'mdhd' and self._current_track is not None:
+            source.seek(payload_offset)
+            raw = source.read(min(payload_size, 64))
+            if len(raw) >= 4:
+                version = raw[0]
+                if version == 0 and len(raw) >= 16:
+                    timescale = struct.unpack(">I", raw[12:16])[0]
+                    self._current_track["timescale"] = timescale
+                elif version == 1 and len(raw) >= 24:
+                    timescale = struct.unpack(">I", raw[20:24])[0]
+                    self._current_track["timescale"] = timescale
 
     def _emit_mdat_samples(self, mdat_offset: int, mdat_size: int,
                            depth: int, mdat_box_index: int) -> Generator[PacketInfo, None, None]:
@@ -1341,10 +1368,22 @@ class MP4Parser(BaseParser):
         if self._timescale > 0 and self._duration > 0:
             duration_ms = int(self._duration * 1000 / self._timescale)
 
+        # Store tracks data for bitrate analysis
+        tracks_for_bitrate = []
+        for track in self._tracks:
+            tracks_for_bitrate.append({
+                "handler": track.get("handler", ""),
+                "timescale": track.get("timescale", 0),
+                "stts": track.get("stts", []),
+                "stsz": track.get("stsz", []),
+                "stss": track.get("stss", set()),
+            })
+
         return StreamInfo(
             source_path="",
             format_name="MP4/MOV",
             duration_ms=duration_ms,
             total_tags=self._box_count,
             file_size=self._file_size,
+            metadata={"tracks": tracks_for_bitrate},
         )

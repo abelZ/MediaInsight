@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence, QActionGroup
-from typing import Optional
+from typing import Optional, List
 
 from media_analyzer.core.models import PacketInfo, StreamInfo, TagType, NALUInfo
 from media_analyzer.core.source import FileSource, StreamingHTTPSource
@@ -30,7 +30,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Media Analyzer - FLV")
+        self.setWindowTitle("MediaInsight")
         self.setMinimumSize(1280, 720)
         self.resize(1400, 800)
 
@@ -43,7 +43,9 @@ class MainWindow(QMainWindow):
         self._format_detected: bool = False  # Whether we've auto-switched view for this file
         self._box_tree_view = None  # MP4 box tree widget (created on demand)
         self._rtmp_view = None  # RTMPDualView widget (created on demand)
+        self._hls_view = None  # HLS segment list view (created on demand)
         self._current_file_path: Optional[str] = None  # Current file path for player page
+        self._all_packets: List[PacketInfo] = []  # All packets for bitrate analysis (all formats)
 
         self._setup_models()
         self._setup_ui()
@@ -66,6 +68,7 @@ class MainWindow(QMainWindow):
         # Navigation tab bar
         self._nav_bar = QTabBar()
         self._nav_bar.addTab("Analyzer")
+        self._nav_bar.addTab("Bitrate")
         self._nav_bar.addTab("Player")
         self._nav_bar.setExpanding(False)
         self._nav_bar.setDrawBase(False)
@@ -114,7 +117,12 @@ class MainWindow(QMainWindow):
         analyzer_layout.addWidget(main_splitter)
         self._pages.addWidget(analyzer_page)
 
-        # --- Page 1: Player (lazy-loaded) ---
+        # --- Page 1: Bitrate (lazy-loaded) ---
+        self._bitrate_page = None
+        bitrate_placeholder = QWidget()
+        self._pages.addWidget(bitrate_placeholder)
+
+        # --- Page 2: Player (lazy-loaded) ---
         self._player_page = None
         player_placeholder = QWidget()  # Placeholder until first use
         self._pages.addWidget(player_placeholder)
@@ -241,6 +249,7 @@ class MainWindow(QMainWindow):
         help_menu = menubar.addMenu("Help")
 
         about_action = QAction("About", self)
+        about_action.setMenuRole(QAction.MenuRole.NoRole)  # Prevent macOS from moving it
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
@@ -251,11 +260,23 @@ class MainWindow(QMainWindow):
             "About MediaInsight",
             "<h3>MediaInsight</h3>"
             "<p>A cross-platform media analysis tool.</p>"
-            "<p>Supports FLV, MPEG-TS, MP4/MOV format parsing at raw byte level.</p>"
+            "<p>Parses media files at raw byte level without FFmpeg dependency.</p>"
+            "<hr>"
+            "<p><b>Supported Formats:</b></p>"
+            "<ul>"
+            "<li>FLV (Flash Video)</li>"
+            "<li>MPEG-TS (Transport Stream)</li>"
+            "<li>MP4/MOV (ISO BMFF)</li>"
+            "<li>RTMP / RTMPS (Live Stream)</li>"
+            "<li>HLS / M3U8 (HTTP Live Streaming)</li>"
+            "<li>HTTP/HTTPS progressive download</li>"
+            "</ul>"
+            "<p><b>Features:</b> Packet analysis, PES reassembly, NALU parsing, "
+            "Bitrate chart, Video playback, MediaInfo display</p>"
             "<hr>"
             "<p><b>Developer:</b> Abel</p>"
             "<p><b>Email:</b> fylaotou@gmail.com</p>"
-            "<p><b>Version:</b> 0.1.0</p>"
+            "<p><b>Version:</b> 0.3.0</p>"
         )
 
     def _setup_statusbar(self):
@@ -339,8 +360,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QInputDialog, QLineEdit
         dialog = QInputDialog(self)
         dialog.setWindowTitle("Open URL")
-        dialog.setLabelText("Enter stream URL (HTTP/HTTPS/RTMP):")
-        dialog.setTextValue("rtmp://")
+        dialog.setLabelText("Enter stream URL (HTTP/HTTPS/RTMP/RTMPS/HLS):")
+        dialog.setTextValue("http://")
         dialog.setInputMode(QInputDialog.InputMode.TextInput)
         dialog.resize(500, 150)
         ok = dialog.exec()
@@ -350,6 +371,8 @@ class MainWindow(QMainWindow):
             self._reset_player_on_new_file()
             if url.startswith("rtmp://") or url.startswith("rtmps://"):
                 self._start_rtmp(url)
+            elif ".m3u8" in url.split("?")[0] or url.endswith(".m3u8"):
+                self._start_hls(url)
             else:
                 source = StreamingHTTPSource(url)
                 self._start_parsing(source)
@@ -558,6 +581,161 @@ class MainWindow(QMainWindow):
         self._table_view.show()
         self._rtmp_control_bar.hide()
 
+    # --- HLS ---
+
+    def _start_hls(self, url: str):
+        """Start HLS analysis: download M3U8, show segment list."""
+        import urllib.request
+        import urllib.error
+        from media_analyzer.core.hls.m3u8_parser import parse_m3u8
+
+        # Stop any existing workers
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(3000)
+        self._stop_rtmp()
+        self._swap_from_rtmp_view()
+
+        # Clear existing data
+        self._table_model.clear()
+        self._all_packets.clear()
+        self._detail_panel.clear()
+        self._hex_view.clear()
+
+        self._status_label.setText(f"Downloading M3U8: {url}")
+
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("User-Agent", "MediaInsight/1.0")
+            response = urllib.request.urlopen(req, timeout=15)
+            content = response.read().decode("utf-8")
+            response.close()
+        except Exception as e:
+            self._status_label.setText(f"Error: {str(e)}")
+            QMessageBox.warning(self, "HLS Error", f"Failed to download M3U8:\n{str(e)}")
+            return
+
+        # Parse M3U8
+        try:
+            playlist = parse_m3u8(content, url)
+        except Exception as e:
+            self._status_label.setText(f"Error: {str(e)}")
+            QMessageBox.warning(self, "HLS Error", f"Failed to parse M3U8:\n{str(e)}")
+            return
+
+        if playlist.is_master:
+            self._status_label.setText("Error: Master playlist not supported")
+            QMessageBox.warning(self, "HLS Error",
+                "This is a Master playlist (multi-bitrate).\n"
+                "Please open a specific rendition/variant M3U8 URL instead.")
+            return
+
+        if not playlist.segments:
+            self._status_label.setText("Error: No segments found")
+            QMessageBox.warning(self, "HLS Error", "M3U8 contains no media segments.")
+            return
+
+        # Show HLS view
+        self._swap_to_hls_view()
+        self._hls_view.load_playlist(playlist, raw_content=content)
+        self._status_label.setText(
+            f"HLS: {len(playlist.segments)} segments | "
+            f"Total: {playlist.total_duration:.1f}s")
+        self.setWindowTitle(f"MediaInsight - {url.split('/')[-1].split('?')[0]}")
+
+    def _on_hls_segment_clicked(self, segment):
+        """Handle HLS segment click — download and parse."""
+        from media_analyzer.workers.hls_worker import HLSSegmentWorker
+
+        # Stop any running segment worker
+        if hasattr(self, '_hls_segment_worker') and self._hls_segment_worker:
+            self._hls_segment_worker.stop()
+            self._hls_segment_worker.wait(3000)
+
+        # Mark as downloading
+        self._hls_view.set_segment_status(segment.index, "downloading")
+
+        # Clear right-side views
+        self._table_model.clear()
+        self._all_packets.clear()
+        self._detail_panel.clear()
+        self._hex_view.clear()
+        self._format_detected = False
+        self._swap_to_table_view()  # Ensure table view (not box tree)
+
+        # Start download + parse
+        self._hls_segment_worker = HLSSegmentWorker(segment.uri, self)
+        self._hls_segment_worker.packets_ready.connect(self._on_packets_ready)
+        self._hls_segment_worker.progress.connect(self._on_progress)
+        self._hls_segment_worker.parse_finished.connect(
+            lambda si: self._on_hls_segment_parsed(si, segment.index))
+        self._hls_segment_worker.error.connect(
+            lambda err: self._on_hls_segment_error(err, segment.index))
+        self._hls_segment_worker.start()
+
+        self._progress_bar.setValue(0)
+        self._progress_bar.show()
+        self._status_label.setText(f"Downloading segment #{segment.index}...")
+
+        # Store worker as current for hex view access
+        self._worker = self._hls_segment_worker
+
+    def _on_hls_segment_parsed(self, stream_info, segment_index: int):
+        """Handle HLS segment parse completion."""
+        self._stream_info = stream_info
+        self._progress_bar.hide()
+        self._hls_view.set_segment_status(segment_index, "loaded")
+
+        count = self._table_model.packet_count
+        self._status_label.setText(
+            f"Segment #{segment_index}: {count:,} packets | "
+            f"{stream_info.format_name}")
+
+    def _on_hls_segment_error(self, error_msg: str, segment_index: int):
+        """Handle HLS segment error."""
+        self._progress_bar.hide()
+        self._hls_view.set_segment_status(segment_index, "error")
+        self._status_label.setText(f"Error: {error_msg}")
+
+    def _swap_to_hls_view(self):
+        """Replace left panel with HLS segment list."""
+        from media_analyzer.ui.hls_view import HLSView
+
+        if hasattr(self, '_hls_view') and self._hls_view is not None:
+            return  # Already in HLS mode
+
+        # Hide other views
+        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            self._box_tree_view.hide()
+            self._box_tree_view.deleteLater()
+            self._box_tree_view = None
+        if self._rtmp_view is not None:
+            self._rtmp_view.hide()
+            self._rtmp_view.deleteLater()
+            self._rtmp_view = None
+            self._rtmp_control_bar.hide()
+
+        self._hls_view = HLSView()
+        self._hls_view.segment_clicked.connect(self._on_hls_segment_clicked)
+
+        # Hide table initially, show HLS list + table side by side
+        # HLS view replaces the table in the left splitter position
+        self._table_view.hide()
+        self._main_splitter.insertWidget(0, self._hls_view)
+        # Also show table (it will be populated when segment is clicked)
+        self._table_view.show()
+
+    def _swap_from_hls_view(self):
+        """Remove HLS view and restore normal layout."""
+        if hasattr(self, '_hls_view') and self._hls_view is not None:
+            self._hls_view.hide()
+            self._hls_view.deleteLater()
+            self._hls_view = None
+        if hasattr(self, '_hls_segment_worker') and self._hls_segment_worker:
+            self._hls_segment_worker.stop()
+            self._hls_segment_worker.wait(3000)
+            self._hls_segment_worker = None
+
     def _apply_filters(self):
         """Apply tag type filters to the table via the proxy model."""
         self._table_view.proxy_model.set_filter(
@@ -589,20 +767,69 @@ class MainWindow(QMainWindow):
     def _on_nav_changed(self, index: int):
         """Handle navigation tab change."""
         if index == 1:
+            # Bitrate page — lazy load
+            self._ensure_bitrate_page()
+            self._load_bitrate_data()
+        elif index == 2:
             # Player page — lazy load
             self._ensure_player_page()
-            # If we have a file loaded, pass it to the player
+            # Pass URL/path + source for MediaInfo temp file fallback
             if self._player_page and self._current_file_path:
-                # RTMP mode: generate temp FLV from captured data for playback
-                if self._current_file_path.startswith("rtmp://") or self._current_file_path.startswith("rtmps://"):
-                    self._play_rtmp_as_flv()
-                else:
-                    source = self._worker.source if self._worker else None
-                    self._player_page.load_file(self._current_file_path, source=source)
+                source = self._worker.source if self._worker else None
+                # For RTMP: generate temp FLV for MediaInfo
+                mediainfo_path = self._get_mediainfo_path()
+                self._player_page.load_file(
+                    self._current_file_path, mediainfo_path=mediainfo_path)
         self._pages.setCurrentIndex(index)
 
+    def _get_mediainfo_path(self) -> Optional[str]:
+        """Get a local file path for MediaInfo (generates temp file if needed)."""
+        path = self._current_file_path
+        if not path:
+            return None
+
+        # Local file: use directly
+        if not path.startswith("http") and not path.startswith("rtmp"):
+            return path
+
+        # HTTP stream with downloaded data: save to temp file
+        if self._worker:
+            from media_analyzer.core.source import StreamingHTTPSource
+            source = self._worker.source
+            if isinstance(source, StreamingHTTPSource) and source.is_fully_downloaded:
+                import tempfile, os
+                ext = os.path.splitext(source.name)[1] or ".ts"
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=ext, delete=False, prefix="mediainsight_mi_")
+                tmp.write(source.read_range(0, source.downloaded_bytes))
+                tmp.close()
+                return tmp.name
+
+        # RTMP: generate temp FLV from captured data
+        if path.startswith("rtmp://") or path.startswith("rtmps://"):
+            payloads = []
+            has_video = has_audio = False
+            if self._rtmp_worker:
+                payloads = self._rtmp_worker.flv_payloads
+                has_video = self._rtmp_worker.has_video
+                has_audio = self._rtmp_worker.has_audio
+            elif hasattr(self, '_last_rtmp_payloads') and self._last_rtmp_payloads:
+                payloads = self._last_rtmp_payloads
+                has_video = getattr(self, '_last_rtmp_has_video', True)
+                has_audio = getattr(self, '_last_rtmp_has_audio', True)
+            if payloads:
+                import tempfile
+                from media_analyzer.core.rtmp.flv_writer import write_flv_file
+                tmp = tempfile.NamedTemporaryFile(
+                    suffix=".flv", delete=False, prefix="mediainsight_mi_")
+                tmp.close()
+                write_flv_file(tmp.name, payloads, has_video, has_audio)
+                return tmp.name
+
+        return None
+
     def _reset_player_on_new_file(self):
-        """Reset player page state when a new file is opened."""
+        """Reset player and bitrate pages when a new file is opened."""
         # Switch back to Analyzer tab
         if self._nav_bar.currentIndex() != 0:
             self._nav_bar.setCurrentIndex(0)
@@ -611,39 +838,39 @@ class MainWindow(QMainWindow):
             self._player_page.cleanup()
             self._player_page._loaded = False
 
-    def _play_rtmp_as_flv(self):
-        """Generate temp FLV from RTMP captured data and play it."""
-        import tempfile
-        from media_analyzer.core.rtmp.flv_writer import write_flv_file
+        if self._bitrate_page:
+            self._bitrate_page.clear()  # Also stops live mode
 
-        # Get payloads from active worker or saved data
-        payloads = []
-        has_video = False
-        has_audio = False
+    def _ensure_bitrate_page(self):
+        """Create the bitrate page on first use."""
+        if self._bitrate_page is not None:
+            return
+        from media_analyzer.ui.bitrate_page import BitratePage
+        self._bitrate_page = BitratePage()
+        # Replace placeholder at index 1
+        old = self._pages.widget(1)
+        self._pages.removeWidget(old)
+        old.deleteLater()
+        self._pages.insertWidget(1, self._bitrate_page)
 
-        if self._rtmp_worker:
-            payloads = self._rtmp_worker.flv_payloads
-            has_video = self._rtmp_worker.has_video
-            has_audio = self._rtmp_worker.has_audio
-        elif hasattr(self, '_last_rtmp_payloads'):
-            payloads = self._last_rtmp_payloads
-            has_video = getattr(self, '_last_rtmp_has_video', True)
-            has_audio = getattr(self, '_last_rtmp_has_audio', True)
-
-        if not payloads:
-            self._status_label.setText("No FLV data captured yet for playback")
+    def _load_bitrate_data(self):
+        """Feed packet data to the bitrate page."""
+        if not self._bitrate_page:
             return
 
-        # Write to temp file
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=".flv", delete=False, prefix="mediainsight_rtmp_")
-        tmp.close()
-        write_flv_file(tmp.name, payloads, has_video, has_audio)
-
-        # Play the local temp file (MediaInfo + player both use local path)
-        self._player_page.load_file(tmp.name)
-        self._status_label.setText(
-            f"Playing RTMP capture ({len(payloads)} tags)")
+        # RTMP mode: start live update
+        if self._rtmp_view and self._rtmp_worker:
+            packets = self._rtmp_view._flv_model._packets
+            self._bitrate_page.load_packets(packets)
+            # Start live mode — refresh chart every 2s with latest data
+            self._bitrate_page.start_live_mode(
+                packets_fn=lambda: self._rtmp_view._flv_model._packets if self._rtmp_view else []
+            )
+        else:
+            # Static file mode: load once
+            self._bitrate_page.stop_live_mode()
+            packets = self._all_packets
+            self._bitrate_page.load_packets(packets, self._stream_info)
 
     def _ensure_player_page(self):
         """Create the player page on first use."""
@@ -651,8 +878,8 @@ class MainWindow(QMainWindow):
             return
         from media_analyzer.ui.player_page import PlayerPage
         self._player_page = PlayerPage()
-        # Replace placeholder at index 1
-        old = self._pages.widget(1)
+        # Replace placeholder at index 2
+        old = self._pages.widget(2)
         self._pages.removeWidget(old)
         old.deleteLater()
         self._pages.addWidget(self._player_page)
@@ -719,8 +946,12 @@ class MainWindow(QMainWindow):
         self._stop_rtmp()
         self._swap_from_rtmp_view()
 
+        # Stop HLS if active
+        self._swap_from_hls_view()
+
         # Clear existing data
         self._table_model.clear()
+        self._all_packets.clear()
         self._detail_panel.clear()
         self._hex_view.clear()
         self._format_detected = False
@@ -784,6 +1015,9 @@ class MainWindow(QMainWindow):
             self._table_model.append_packets(packets)
             self._table_view.setUpdatesEnabled(True)
 
+        # Always accumulate for bitrate analysis
+        self._all_packets.extend(packets)
+
         # Update status (lightweight — just show count)
         count = self._table_model.packet_count
         self._status_label.setText(f"{count:,} tags loaded")
@@ -842,7 +1076,7 @@ class MainWindow(QMainWindow):
         self._info_label.setText(" | ".join(info_parts))
 
         # Update window title
-        self.setWindowTitle(f"Media Analyzer - {stream_info.source_path}")
+        self.setWindowTitle(f"MediaInsight - {stream_info.source_path}")
 
     def _on_parse_error(self, error_msg: str):
         """Handle parsing error."""

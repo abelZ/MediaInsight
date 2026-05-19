@@ -134,6 +134,37 @@ class FileSource(DataSource):
             self._file = None
 
 
+class BufferSource(DataSource):
+    """
+    In-memory buffer data source.
+    Used for HLS segments that are downloaded into memory.
+    """
+
+    def __init__(self, data: bytes, name: str = "buffer"):
+        self._data = data
+        self._name = name
+
+    def open(self) -> BinaryIO:
+        return io.BytesIO(self._data)
+
+    def read_range(self, offset: int, size: int) -> bytes:
+        end = min(offset + size, len(self._data))
+        if offset >= len(self._data):
+            return b""
+        return self._data[offset:end]
+
+    @property
+    def size(self) -> int:
+        return len(self._data)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def close(self) -> None:
+        pass
+
+
 class HTTPStreamSource(DataSource):
     """
     HTTP/HTTPS progressive download source.

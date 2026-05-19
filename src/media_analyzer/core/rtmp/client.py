@@ -316,16 +316,17 @@ class RTMPClient:
         """Close the RTMP connection."""
         self._connected = False
         self._pause_event.set()  # Unblock if paused
-        if self._socket:
+        sock = self._socket
+        self._socket = None
+        if sock:
             try:
-                self._socket.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             try:
-                self._socket.close()
+                sock.close()
             except OSError:
                 pass
-            self._socket = None
 
     # --- Internal Methods ---
 

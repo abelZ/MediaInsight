@@ -43,6 +43,7 @@ class RTMPMessage:
 class _ChunkStreamState:
     """Per-chunk-stream state for reassembly."""
     timestamp: int = 0
+    timestamp_delta: int = 0  # Last delta for fmt 3 repeat
     msg_length: int = 0
     msg_type_id: int = 0
     msg_stream_id: int = 0
@@ -162,6 +163,7 @@ class ChunkReader:
                 timestamp = struct.unpack_from(">I", buf, pos)[0]
                 pos += 4
             state.timestamp = timestamp
+            state.timestamp_delta = 0  # Absolute timestamp, no delta
 
         elif fmt == ChunkFmt.TYPE_1:
             # 7 bytes: timestamp_delta(3) + msg_length(3) + msg_type(1)
@@ -182,6 +184,7 @@ class ChunkReader:
                 timestamp_delta = struct.unpack_from(">I", buf, pos)[0]
                 pos += 4
             state.timestamp += timestamp_delta
+            state.timestamp_delta = timestamp_delta  # Save for fmt 3
 
         elif fmt == ChunkFmt.TYPE_2:
             # 3 bytes: timestamp_delta(3)
@@ -197,11 +200,14 @@ class ChunkReader:
                 timestamp_delta = struct.unpack_from(">I", buf, pos)[0]
                 pos += 4
             state.timestamp += timestamp_delta
+            state.timestamp_delta = timestamp_delta  # Save for fmt 3
 
         else:  # fmt == ChunkFmt.TYPE_3
-            # 0 bytes message header — use previous values
-            # Check for extended timestamp if previous had one
-            pass
+            # 0 bytes message header — reuse previous header values
+            # Only apply delta if this is a NEW message (not a continuation chunk)
+            # Continuation chunks (mid-message) should NOT advance timestamp
+            if len(state.payload_buf) == 0:
+                state.timestamp += state.timestamp_delta
 
         # --- Read Chunk Data ---
         # If this is a new message (buffer empty), initialize remaining
