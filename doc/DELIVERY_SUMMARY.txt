@@ -1,0 +1,295 @@
+RTMP Support Implementation - Planning & Documentation Complete
+================================================================
+
+DOCUMENTATION DELIVERED (6 files, 770 lines total):
+
+1. FLV_PARSER_ANALYSIS.md (203 lines)
+   - Complete FLV file format breakdown
+   - Tag structure details (header + payload)
+   - Video/audio/script tag parsing
+   - NALU extraction (H.264, H.265, AV1)
+   - UI integration flows
+   - Key reuse opportunities
+
+2. FLV_PARSER_TECHNICAL_SUMMARY.md (90 lines)
+   - Quick reference guide
+   - Key constants and formats
+   - Tag type identifiers
+
+3. RTMP_EXECUTIVE_SUMMARY.md (79 lines)
+   - High-level project overview
+   - 3-layer architecture
+   - Code reuse strategy
+   - Implementation phases
+   - Risk assessment
+
+4. RTMP_PLANNING_SUMMARY.md (144 lines)
+   - 4-phase implementation roadmap
+   - RTMP protocol overview
+   - Component responsibilities
+   - Implementation checklist
+   - Advanced features checklist
+
+5. RTMP_TECHNICAL_REFERENCE.md (151 lines)
+   - Detailed RTMP protocol specs
+   - Handshake procedure
+   - Chunk header formats (4 types)
+   - Message types and structures
+   - Control and media messages
+   - AMF0 command format
+   - Reassembly algorithm
+   - Error handling strategies
+
+6. IMPLEMENTATION_GUIDE.md (155 lines)
+   - Step-by-step implementation walkthrough
+   - Directory structure setup
+   - StreamingRTMPSource key methods
+   - RTMPParser implementation strategy
+   - UI integration points
+   - Design principles
+   - Testing approach
+
+KEY DESIGN INSIGHT
+==================
+
+100% Code Reuse of FLV Tag Parsing:
+
+All 7 FLVParser methods reused unchanged:
+  - _parse_video_tag_traditional()
+  - _parse_video_tag_enhanced()
+  - _parse_avc_nalus()
+  - _parse_hevc_nalus()
+  - _parse_av1_obus()
+  - _parse_audio_tag()
+  - _parse_script_tag()
+
+Why this works:
+  - FLV tag structure identical in files and RTMP messages
+  - Methods decoupled from file I/O
+  - PacketInfo model format-agnostic
+
+Result:
+  - RTMPParser: Thin wrapper (300 lines) + delegation
+  - No reimplementation of tag parsing logic
+  - Reduced bugs and maintenance burden
+
+CODE STRUCTURE
+==============
+
+New Code Required (~1100 lines):
+  - StreamingRTMPSource: ~800 lines
+    * URL parsing
+    * Socket management
+    * RTMP handshake
+    * Chunk reassembly
+    * Message buffering
+    * Connect/CreateStream commands
+  
+  - RTMPParser: ~300 lines
+    * FLV header synthesis
+    * Message dispatch
+    * Tag extraction
+    * Integration with FLVParser
+
+UI Changes Required (~5 lines):
+  - MainWindow._open_url()
+    * Add URL detection for rtmp://
+    * Route to StreamingRTMPSource
+
+Reused Code:
+  - FLVParser: ~1150 lines (100% unchanged)
+  - ParseWorker: Unchanged
+  - All UI components: Unchanged
+
+RTMP PROTOCOL SUMMARY
+=====================
+
+Handshake (3072 bytes total):
+  C0: 1 byte (version 0x03)
+  C1: 1536 bytes (timestamp + random)
+  S0: 1 byte (version 0x03)
+  S1: 1536 bytes (timestamp + random)
+  S2: 1536 bytes (copy of C1)
+  C2: 1536 bytes (copy of S1)
+
+Messages:
+  Type 8: Audio Data (FLV tag)
+  Type 9: Video Data (FLV tag)
+  Type 18: Script Data (metadata)
+  Type 20: Command (Connect, CreateStream, Play)
+
+Chunks (4 header formats):
+  Format 0: Full (12 bytes) - [header | timestamp | length | type | stream_id]
+  Format 1: No ID (8 bytes) - [header | delta_ts | length | type]
+  Format 2: Delta (4 bytes) - [header | delta_ts]
+  Format 3: Reuse (1 byte) - [header]
+
+IMPLEMENTATION PHASES
+====================
+
+Phase 1: Network Foundation
+  - RTMPURLParser
+  - Socket connection
+  - RTMP handshake
+  - Test with public servers
+
+Phase 2: RTMP Protocol & Messaging
+  - Chunk parsing (4 formats)
+  - ChunkReassembler state machine
+  - Connect command (AMF0)
+  - CreateStream command
+  - Message dispatch
+
+Phase 3: RTMPParser Implementation
+  - FLV header synthesis
+  - Message extraction
+  - Tag dispatch
+  - FLVParser integration
+
+Phase 4: UI Integration & Testing
+  - URL detection in MainWindow
+  - Manual testing
+  - Performance testing
+  - Error handling
+
+TASK STATUS
+===========
+
+Task #24: Design RTMP Source Layer [IN PROGRESS]
+  Status: Planning complete, documentation ready
+  Deliverable: src/media_analyzer/network/rtmp_source.py
+  Next: Begin implementation of handshake + chunk reassembly
+
+Task #25: Design RTMP Parser Layer [IN PROGRESS]
+  Status: Planning complete, documentation ready
+  Deliverable: src/media_analyzer/parsers/rtmp/parser.py
+  Next: Begin implementation after #24 basic protocol works
+
+Task #26: Integrate RTMP with UI Threading [PENDING]
+  Status: Design complete, only 5 lines of UI changes needed
+  Deliverable: Modified src/media_analyzer/ui/main_window.py
+  Dependencies: #24 and #25 must be complete
+
+TESTING STRATEGY
+================
+
+Unit Tests:
+  1. RTMP handshake protocol
+  2. Chunk reassembly (4 formats, extended IDs)
+  3. Message type dispatch
+  4. Tag extraction
+  5. FLV header synthesis
+
+Integration Tests:
+  1. Connect to public RTMP server
+  2. Receive and parse audio stream
+  3. Receive and parse video stream
+  4. Verify codec variations
+  5. Handle connection failures
+
+Manual Tests:
+  1. Live RTMP stream in UI
+  2. VOD RTMP stream in UI
+  3. Save stream to file
+  4. Performance with high-bitrate
+
+DEPENDENCIES
+============
+
+Required (Already Available):
+  - socket, struct, threading (stdlib)
+  - BaseParser (existing)
+  - DataSource (existing)
+  - FLVParser (existing)
+  - PacketInfo (existing)
+  - AMF0Encoder/Decoder (existing)
+
+NOT Required:
+  - External RTMP library
+  - FFmpeg
+  - Any new dependencies
+
+NEXT STEPS
+==========
+
+1. Create src/media_analyzer/network/rtmp_source.py
+   Focus: RTMP handshake + basic socket operations
+   
+2. Implement RTMPURLParser and socket connection
+   Test: Connect to echo server
+   
+3. Implement handshake (C0/C1/C2)
+   Test: Verify with public RTMP server
+   
+4. Implement chunk reassembly
+   Test: Unit tests for 4 header formats
+   
+5. Implement Connect/CreateStream commands
+   Test: Connect to RTMP server
+   
+6. Create RTMPParser and integrate with FLVParser
+   Test: Parse RTMP stream messages
+   
+7. Add UI integration (URL detection)
+   Test: End-to-end with UI
+   
+8. Comprehensive testing and optimization
+   Test: Performance profiling
+
+ARCHITECTURE BENEFITS
+=====================
+
+1. Minimal Code Change
+   - No changes to existing parsers
+   - ~5 lines in UI code
+   - Clean separation of concerns
+
+2. Code Reuse
+   - 100% of tag parsing reused
+   - Proven, tested logic
+   - Reduced bugs and maintenance
+
+3. Abstraction
+   - DataSource interface handles source type
+   - ParseWorker abstracts threading
+   - UI doesn't change for new formats
+
+4. Extensibility
+   - Easy to add more streaming protocols
+   - Only need new source + parser
+   - No UI changes needed
+
+ESTIMATED TIMELINE
+==================
+
+Week 1: Socket + handshake + chunking
+Week 2: Connect/CreateStream + RTMPParser
+Week 3: UI integration + testing
+Week 4: Optimization + polish
+
+Total: 4 weeks
+
+CONCLUSION
+==========
+
+RTMP support is well-planned with comprehensive documentation covering:
+- FLV parser infrastructure analysis
+- RTMP protocol specifications
+- Implementation strategy and roadmap
+- Code reuse opportunities
+- Testing approach
+- Integration points
+
+The design leverages existing abstractions to minimize code changes while
+maintaining clean architecture. All tag parsing logic is reused from the
+proven FLV parser implementation.
+
+Ready to proceed with Phase 1: StreamingRTMPSource implementation.
+
+Documentation files committed to repository:
+  - FLV_PARSER_ANALYSIS.md
+  - FLV_PARSER_TECHNICAL_SUMMARY.md
+  - RTMP_EXECUTIVE_SUMMARY.md
+  - RTMP_PLANNING_SUMMARY.md
+  - RTMP_TECHNICAL_REFERENCE.md
+  - IMPLEMENTATION_GUIDE.md

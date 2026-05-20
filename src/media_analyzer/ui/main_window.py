@@ -562,6 +562,7 @@ class MainWindow(QMainWindow):
         # Hide box tree if visible
         if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             self._box_tree_view.hide()
+            self._box_tree_view.setParent(None)
             self._box_tree_view.deleteLater()
             self._box_tree_view = None
 
@@ -571,14 +572,20 @@ class MainWindow(QMainWindow):
         # Hide table, show RTMP view in the same splitter position
         self._table_view.hide()
         self._main_splitter.insertWidget(0, self._rtmp_view)
+        # Splitter now has 3 widgets: [rtmp_view, table_view(hidden), right_splitter]
+        # Give hidden table 0, distribute between rtmp and right panel
+        self._main_splitter.setSizes([800, 0, 450])
 
     def _swap_from_rtmp_view(self):
         """Remove RTMP view and restore normal table."""
         if self._rtmp_view is not None:
             self._rtmp_view.hide()
+            self._rtmp_view.setParent(None)  # Immediately remove from splitter
             self._rtmp_view.deleteLater()
             self._rtmp_view = None
         self._table_view.show()
+        # Splitter is back to 2 widgets: [table_view, right_splitter]
+        self._main_splitter.setSizes([800, 450])
         self._rtmp_control_bar.hide()
 
     # --- HLS ---
@@ -707,10 +714,12 @@ class MainWindow(QMainWindow):
         # Hide other views
         if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             self._box_tree_view.hide()
+            self._box_tree_view.setParent(None)
             self._box_tree_view.deleteLater()
             self._box_tree_view = None
         if self._rtmp_view is not None:
             self._rtmp_view.hide()
+            self._rtmp_view.setParent(None)
             self._rtmp_view.deleteLater()
             self._rtmp_view = None
             self._rtmp_control_bar.hide()
@@ -724,17 +733,23 @@ class MainWindow(QMainWindow):
         self._main_splitter.insertWidget(0, self._hls_view)
         # Also show table (it will be populated when segment is clicked)
         self._table_view.show()
+        # Splitter now has 3 widgets: [hls_view, table_view, right_splitter]
+        self._main_splitter.setSizes([300, 500, 450])
 
     def _swap_from_hls_view(self):
         """Remove HLS view and restore normal layout."""
         if hasattr(self, '_hls_view') and self._hls_view is not None:
             self._hls_view.hide()
+            self._hls_view.setParent(None)  # Immediately remove from splitter
             self._hls_view.deleteLater()
             self._hls_view = None
         if hasattr(self, '_hls_segment_worker') and self._hls_segment_worker:
             self._hls_segment_worker.stop()
             self._hls_segment_worker.wait(3000)
             self._hls_segment_worker = None
+        # Restore splitter to 2 widgets: [table_view, right_splitter]
+        self._table_view.show()
+        self._main_splitter.setSizes([800, 450])
 
     def _apply_filters(self):
         """Apply tag type filters to the table via the proxy model."""
@@ -924,14 +939,19 @@ class MainWindow(QMainWindow):
         # Hide table, show tree in the same splitter position
         self._table_view.hide()
         self._main_splitter.insertWidget(0, self._box_tree_view)
+        # Splitter now has 3 widgets: [box_tree_view, table_view(hidden), right_splitter]
+        self._main_splitter.setSizes([800, 0, 450])
 
     def _swap_to_table_view(self):
         """Restore the table view (when switching from MP4 back to FLV/TS)."""
         if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             self._box_tree_view.hide()
+            self._box_tree_view.setParent(None)
             self._box_tree_view.deleteLater()
             self._box_tree_view = None
         self._table_view.show()
+        # Restore splitter proportions
+        self._main_splitter.setSizes([800, 450])
 
     # --- Parsing ---
 

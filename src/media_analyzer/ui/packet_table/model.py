@@ -13,6 +13,8 @@ FLV_COLUMNS = [
     ("No.",         "index",            50),
     ("Type",        "type_label",       60),
     ("Timestamp",   "timestamp",        80),
+    ("Time",        "_time_human",      80),
+    ("Delta",       "_delta_ms",        50),
     ("Size",        "data_size",        70),
     ("Offset",      "offset",           90),
     ("CTS",         "composition_time", 50),
@@ -46,6 +48,8 @@ TS_PKT_COLUMNS = [
     ("CC",          "_cc",              35),
     ("PUSI",        "_pusi",            45),
     ("Timestamp",   "timestamp",        90),
+    ("Time",        "_time_human",      80),
+    ("Delta",       "_delta_ms",        50),
     ("Size",        "data_size",        70),
     ("Offset",      "offset",           90),
     ("Codec",       "codec_label",      90),
@@ -210,9 +214,9 @@ class PacketTableModel(QAbstractTableModel):
             # Right-align numeric columns
             if col_attr in ("index", "timestamp", "data_size", "offset",
                            "composition_time", "dts", "pts", "_pid", "_cc",
-                           "_csid", "_msg_stream_id"):
+                           "_csid", "_msg_stream_id", "_delta_ms"):
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            elif col_attr in ("_pusi", "_direction"):
+            elif col_attr in ("_pusi", "_direction", "_time_human"):
                 return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.UserRole:
@@ -292,6 +296,23 @@ class PacketTableModel(QAbstractTableModel):
 
     # --- Formatting ---
 
+    def _get_delta(self, packet: PacketInfo) -> str:
+        """Get timestamp delta from previous same-type packet."""
+        if packet.tag_type not in (TagType.VIDEO, TagType.AUDIO):
+            return ""
+        if packet.timestamp <= 0:
+            return ""
+        # Search backwards for previous same-type packet
+        idx = packet.index
+        for i in range(idx - 1, max(idx - 200, -1), -1):
+            if i < 0 or i >= len(self._packets):
+                break
+            prev = self._packets[i]
+            if prev.tag_type == packet.tag_type and prev.timestamp > 0:
+                delta = packet.timestamp - prev.timestamp
+                return str(delta)
+        return ""
+
     def _format_cell(self, packet: PacketInfo, attr: str) -> str:
         """Format a cell value for display."""
         # TS-specific virtual columns (from script_data)
@@ -325,6 +346,23 @@ class PacketTableModel(QAbstractTableModel):
             if packet.script_data and "msg_stream_id" in packet.script_data:
                 return str(packet.script_data["msg_stream_id"])
             return ""
+        # Time/Delta virtual columns
+        elif attr == "_time_human":
+            ts = packet.timestamp
+            if ts <= 0:
+                return ""
+            total_sec = ts // 1000
+            ms = ts % 1000
+            mins = total_sec // 60
+            secs = total_sec % 60
+            hours = mins // 60
+            mins = mins % 60
+            if hours > 0:
+                return f"{hours}:{mins:02d}:{secs:02d}.{ms:03d}"
+            return f"{mins:02d}:{secs:02d}.{ms:03d}"
+        elif attr == "_delta_ms":
+            # Compute delta from previous same-type packet
+            return self._get_delta(packet)
 
         value = getattr(packet, attr, None)
 

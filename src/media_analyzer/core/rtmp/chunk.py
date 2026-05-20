@@ -109,6 +109,9 @@ class ChunkReader:
             RTMPMessage: if a complete message was reassembled
             False: if a chunk was consumed but message not yet complete
             None: if not enough data to parse a chunk
+
+        IMPORTANT: state is only modified after confirming all data is available,
+        to prevent double-application of timestamp deltas on partial reads.
         """
         buf = self._buffer
         if len(buf) < 1:
@@ -121,13 +124,11 @@ class ChunkReader:
         csid_low = first_byte & 0x3F
 
         if csid_low == 0:
-            # 2 bytes basic header: csid = next byte + 64
             if len(buf) < 2:
                 return None
             csid = buf[1] + 64
             pos = 2
         elif csid_low == 1:
-            # 3 bytes basic header: csid = next 2 bytes (LE) + 64
             if len(buf) < 3:
                 return None
             csid = buf[1] + (buf[2] << 8) + 64
@@ -136,94 +137,97 @@ class ChunkReader:
             csid = csid_low
             pos = 1
 
-        # --- Parse Message Header ---
+        # --- Parse Message Header (into local vars, NOT state yet) ---
         state = self._streams.get(csid)
         if state is None:
             state = _ChunkStreamState()
             self._streams[csid] = state
 
+        new_timestamp = state.timestamp
+        new_timestamp_delta = state.timestamp_delta
+        new_msg_length = state.msg_length
+        new_msg_type_id = state.msg_type_id
+        new_msg_stream_id = state.msg_stream_id
+
         if fmt == ChunkFmt.TYPE_0:
-            # 11 bytes: timestamp(3) + msg_length(3) + msg_type(1) + msg_stream_id(4 LE)
             if len(buf) < pos + 11:
                 return None
             timestamp = int.from_bytes(buf[pos:pos+3], "big")
-            msg_length = int.from_bytes(buf[pos+3:pos+6], "big")
-            msg_type_id = buf[pos+6]
-            msg_stream_id = struct.unpack_from("<I", buf, pos+7)[0]
+            new_msg_length = int.from_bytes(buf[pos+3:pos+6], "big")
+            new_msg_type_id = buf[pos+6]
+            new_msg_stream_id = struct.unpack_from("<I", buf, pos+7)[0]
             pos += 11
 
-            state.msg_length = msg_length
-            state.msg_type_id = msg_type_id
-            state.msg_stream_id = msg_stream_id
-
-            # Extended timestamp
             if timestamp == 0xFFFFFF:
                 if len(buf) < pos + 4:
                     return None
                 timestamp = struct.unpack_from(">I", buf, pos)[0]
                 pos += 4
-            state.timestamp = timestamp
-            state.timestamp_delta = 0  # Absolute timestamp, no delta
+            new_timestamp = timestamp
+            new_timestamp_delta = 0
 
         elif fmt == ChunkFmt.TYPE_1:
-            # 7 bytes: timestamp_delta(3) + msg_length(3) + msg_type(1)
             if len(buf) < pos + 7:
                 return None
             timestamp_delta = int.from_bytes(buf[pos:pos+3], "big")
-            msg_length = int.from_bytes(buf[pos+3:pos+6], "big")
-            msg_type_id = buf[pos+6]
+            new_msg_length = int.from_bytes(buf[pos+3:pos+6], "big")
+            new_msg_type_id = buf[pos+6]
             pos += 7
 
-            state.msg_length = msg_length
-            state.msg_type_id = msg_type_id
-
-            # Extended timestamp
             if timestamp_delta == 0xFFFFFF:
                 if len(buf) < pos + 4:
                     return None
                 timestamp_delta = struct.unpack_from(">I", buf, pos)[0]
                 pos += 4
-            state.timestamp += timestamp_delta
-            state.timestamp_delta = timestamp_delta  # Save for fmt 3
+            new_timestamp = state.timestamp + timestamp_delta
+            new_timestamp_delta = timestamp_delta
 
         elif fmt == ChunkFmt.TYPE_2:
-            # 3 bytes: timestamp_delta(3)
             if len(buf) < pos + 3:
                 return None
             timestamp_delta = int.from_bytes(buf[pos:pos+3], "big")
             pos += 3
 
-            # Extended timestamp
             if timestamp_delta == 0xFFFFFF:
                 if len(buf) < pos + 4:
                     return None
                 timestamp_delta = struct.unpack_from(">I", buf, pos)[0]
                 pos += 4
-            state.timestamp += timestamp_delta
-            state.timestamp_delta = timestamp_delta  # Save for fmt 3
+            new_timestamp = state.timestamp + timestamp_delta
+            new_timestamp_delta = timestamp_delta
 
         else:  # fmt == ChunkFmt.TYPE_3
-            # 0 bytes message header — reuse previous header values
-            # Only apply delta if this is a NEW message (not a continuation chunk)
-            # Continuation chunks (mid-message) should NOT advance timestamp
-            if len(state.payload_buf) == 0:
-                state.timestamp += state.timestamp_delta
+            # No header — reuse previous values, no timestamp change
+            pass
 
         # --- Read Chunk Data ---
-        # If this is a new message (buffer empty), initialize remaining
+        # Determine message length for this chunk
         if len(state.payload_buf) == 0:
-            state.bytes_remaining = state.msg_length
+            # New message: use new_msg_length
+            bytes_remaining = new_msg_length
+        else:
+            # Continuation: use existing remaining
+            bytes_remaining = state.bytes_remaining
 
-        # How many bytes in this chunk?
-        chunk_data_size = min(self._chunk_size, state.bytes_remaining)
+        chunk_data_size = min(self._chunk_size, bytes_remaining)
         if len(buf) < pos + chunk_data_size:
-            return None  # Need more data
+            return None  # Need more data — state NOT modified
+
+        # --- All data available: NOW commit state changes ---
+        state.timestamp = new_timestamp
+        state.timestamp_delta = new_timestamp_delta
+        state.msg_length = new_msg_length
+        state.msg_type_id = new_msg_type_id
+        state.msg_stream_id = new_msg_stream_id
+
+        if len(state.payload_buf) == 0:
+            state.bytes_remaining = new_msg_length
 
         # Extract chunk data
         chunk_data = buf[pos:pos + chunk_data_size]
         pos += chunk_data_size
 
-        # Track raw bytes for this chunk
+        # Track raw bytes
         raw_chunk = bytes(buf[:pos])
         state.raw_buf.extend(raw_chunk)
 
