@@ -1,5 +1,6 @@
 """Main application window."""
 
+import logging
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QWidget, QVBoxLayout, QHBoxLayout,
     QMenuBar, QMenu, QFileDialog, QInputDialog,
@@ -17,6 +18,8 @@ from media_analyzer.ui.packet_table.view import PacketTableView
 from media_analyzer.ui.hex_view import HexViewWidget
 from media_analyzer.ui.detail_panel import DetailPanelWidget
 from media_analyzer.workers.parse_worker import ParseWorker
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -69,7 +72,9 @@ class MainWindow(QMainWindow):
         self._nav_bar = QTabBar()
         self._nav_bar.addTab("Analyzer")
         self._nav_bar.addTab("Bitrate")
+        self._nav_bar.addTab("Timestamp")
         self._nav_bar.addTab("Player")
+        self._nav_bar.addTab("Log")
         self._nav_bar.setExpanding(False)
         self._nav_bar.setDrawBase(False)
         self._nav_bar.currentChanged.connect(self._on_nav_changed)
@@ -122,10 +127,20 @@ class MainWindow(QMainWindow):
         bitrate_placeholder = QWidget()
         self._pages.addWidget(bitrate_placeholder)
 
-        # --- Page 2: Player (lazy-loaded) ---
+        # --- Page 2: Timestamp (lazy-loaded) ---
+        self._timestamp_page = None
+        timestamp_placeholder = QWidget()
+        self._pages.addWidget(timestamp_placeholder)
+
+        # --- Page 3: Player (lazy-loaded) ---
         self._player_page = None
         player_placeholder = QWidget()  # Placeholder until first use
         self._pages.addWidget(player_placeholder)
+
+        # --- Page 4: Log (created immediately to capture from start) ---
+        from media_analyzer.ui.log_page import LogPage
+        self._log_page = LogPage()
+        self._pages.addWidget(self._log_page)
 
         self.setCentralWidget(central)
 
@@ -350,6 +365,7 @@ class MainWindow(QMainWindow):
             "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;All Files (*)"
         )
         if path:
+            logger.info(f"Opening file: {path}")
             self._current_file_path = path
             self._reset_player_on_new_file()
             source = FileSource(path)
@@ -367,6 +383,7 @@ class MainWindow(QMainWindow):
         ok = dialog.exec()
         url = dialog.textValue()
         if ok and url and url not in ("http://", "rtmp://"):
+            logger.info(f"Opening URL: {url}")
             self._current_file_path = url
             self._reset_player_on_new_file()
             if url.startswith("rtmp://") or url.startswith("rtmps://"):
@@ -459,6 +476,7 @@ class MainWindow(QMainWindow):
 
     def _start_rtmp(self, url: str):
         """Start an RTMP session."""
+        logger.info(f"Starting RTMP session: {url}")
         # Stop any existing workers
         self._stop_rtmp()
         if self._worker and self._worker.isRunning():
@@ -786,6 +804,10 @@ class MainWindow(QMainWindow):
             self._ensure_bitrate_page()
             self._load_bitrate_data()
         elif index == 2:
+            # Timestamp page — lazy load
+            self._ensure_timestamp_page()
+            self._load_timestamp_data()
+        elif index == 3:
             # Player page — lazy load
             self._ensure_player_page()
             # Pass URL/path + source for MediaInfo temp file fallback
@@ -844,17 +866,20 @@ class MainWindow(QMainWindow):
         return None
 
     def _reset_player_on_new_file(self):
-        """Reset player and bitrate pages when a new file is opened."""
+        """Reset player and analysis pages when a new file is opened."""
         # Switch back to Analyzer tab
         if self._nav_bar.currentIndex() != 0:
             self._nav_bar.setCurrentIndex(0)
 
         if self._player_page:
-            self._player_page.cleanup()
-            self._player_page._loaded = False
+            # Stop playback but keep VLC alive for next use
+            self._player_page.stop_and_reset()
 
         if self._bitrate_page:
             self._bitrate_page.clear()  # Also stops live mode
+
+        if self._timestamp_page:
+            self._timestamp_page.clear()  # Also stops live mode
 
     def _ensure_bitrate_page(self):
         """Create the bitrate page on first use."""
@@ -887,17 +912,47 @@ class MainWindow(QMainWindow):
             packets = self._all_packets
             self._bitrate_page.load_packets(packets, self._stream_info)
 
+    def _ensure_timestamp_page(self):
+        """Create the timestamp page on first use."""
+        if self._timestamp_page is not None:
+            return
+        from media_analyzer.ui.timestamp_page import TimestampPage
+        self._timestamp_page = TimestampPage()
+        # Replace placeholder at index 2
+        old = self._pages.widget(2)
+        self._pages.removeWidget(old)
+        old.deleteLater()
+        self._pages.insertWidget(2, self._timestamp_page)
+
+    def _load_timestamp_data(self):
+        """Feed packet data to the timestamp page."""
+        if not self._timestamp_page:
+            return
+
+        # RTMP mode: start live update
+        if self._rtmp_view and self._rtmp_worker:
+            packets = self._rtmp_view._flv_model._packets
+            self._timestamp_page.load_packets(packets)
+            self._timestamp_page.start_live_mode(
+                packets_fn=lambda: self._rtmp_view._flv_model._packets if self._rtmp_view else []
+            )
+        else:
+            # Static file mode: load once
+            self._timestamp_page.stop_live_mode()
+            packets = self._all_packets
+            self._timestamp_page.load_packets(packets, self._stream_info)
+
     def _ensure_player_page(self):
         """Create the player page on first use."""
         if self._player_page is not None:
             return
         from media_analyzer.ui.player_page import PlayerPage
         self._player_page = PlayerPage()
-        # Replace placeholder at index 2
-        old = self._pages.widget(2)
+        # Replace placeholder at index 3
+        old = self._pages.widget(3)
         self._pages.removeWidget(old)
         old.deleteLater()
-        self._pages.addWidget(self._player_page)
+        self._pages.insertWidget(3, self._player_page)
 
     # --- View Switching ---
 
@@ -1071,6 +1126,9 @@ class MainWindow(QMainWindow):
     def _on_parse_finished(self, stream_info: StreamInfo):
         """Handle parsing completion."""
         self._stream_info = stream_info
+        count = self._table_model.packet_count
+        logger.info(f"Parse finished: {count} packets, format={stream_info.format_name}, "
+                    f"duration={stream_info.duration_ms}ms")
         self._progress_bar.hide()
         self._stop_action.setEnabled(False)
 
@@ -1100,6 +1158,7 @@ class MainWindow(QMainWindow):
 
     def _on_parse_error(self, error_msg: str):
         """Handle parsing error."""
+        logger.error(f"Parse error: {error_msg}")
         self._progress_bar.hide()
         self._stop_action.setEnabled(False)
         self._status_label.setText(f"Error: {error_msg}")
@@ -1321,6 +1380,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up on window close."""
+        logger.info("Application closing")
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(3000)

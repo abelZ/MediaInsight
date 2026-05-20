@@ -34,6 +34,14 @@ def main():
     """Launch the Media Analyzer application."""
     _setup_platform()
 
+    # Initialize logging before anything else
+    from media_analyzer.core.logging_config import setup_logging
+    setup_logging()
+
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"MediaInsight starting (Python {sys.version.split()[0]}, {platform.system()} {platform.machine()})")
+
     from media_analyzer.app import create_application
     from media_analyzer.ui.main_window import MainWindow
 

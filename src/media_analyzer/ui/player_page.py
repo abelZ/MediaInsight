@@ -27,13 +27,27 @@ try:
 
     _vlc_vendor_path = _os.path.join(_project_root, "vendor", "vlc", _vlc_platform)
 
-    # Also check frozen (PyInstaller) path
+    # Frozen (PyInstaller) path — VLC is bundled differently
     if hasattr(sys, '_MEIPASS'):
-        _vlc_frozen_path = _os.path.join(sys._MEIPASS, "vendor", "vlc", _vlc_platform)
-        if _os.path.isdir(_vlc_frozen_path):
-            _vlc_vendor_path = _vlc_frozen_path
-
-    if _os.path.isdir(_vlc_vendor_path):
+        _meipass = sys._MEIPASS
+        # Check if VLC libs are at the bundle root (Windows: libvlc.dll next to exe)
+        if sys.platform == "win32":
+            _frozen_libvlc = _os.path.join(_meipass, "libvlc.dll")
+            if _os.path.isfile(_frozen_libvlc):
+                _os.environ['PYTHON_VLC_LIB_PATH'] = _frozen_libvlc
+                _plugins = _os.path.join(_meipass, "plugins")
+                if _os.path.isdir(_plugins):
+                    _os.environ['VLC_PLUGIN_PATH'] = _plugins
+                _os.add_dll_directory(_meipass)
+        elif sys.platform == "darwin":
+            _frozen_libvlc = _os.path.join(_meipass, "vlc", "lib", "libvlc.dylib")
+            if _os.path.isfile(_frozen_libvlc):
+                _os.environ['PYTHON_VLC_LIB_PATH'] = _frozen_libvlc
+                _plugins = _os.path.join(_meipass, "vlc", "plugins")
+                if _os.path.isdir(_plugins):
+                    _os.environ['VLC_PLUGIN_PATH'] = _plugins
+    elif _os.path.isdir(_vlc_vendor_path):
+        # Development mode: use vendor/vlc/<platform>/
         if sys.platform == "win32":
             _libvlc_path = _os.path.join(_vlc_vendor_path, "libvlc.dll")
         elif sys.platform == "darwin":
@@ -633,8 +647,16 @@ class PlayerPage(QWidget):
                 return i
         return 0  # Default to "Disabled"
 
+    def stop_and_reset(self):
+        """Stop playback and reset state for new file (keeps VLC alive)."""
+        self._stop()
+        self._file_path = None
+        self._loaded = False
+        # Clear media info tree
+        self._info_tree.clear()
+
     def cleanup(self):
-        """Stop playback and release resources."""
+        """Stop playback and release resources (for app exit)."""
         self._poll_timer.stop()
         if HAS_VLC and self._vlc_ready:
             self._vlc_player.stop()

@@ -11,6 +11,7 @@ PUSI PacketInfo is back-annotated with the detected frame type.
 Reference: ISO/IEC 13818-1 (MPEG-2 Systems)
 """
 
+import logging
 import struct
 from typing import Generator, BinaryIO, Optional, Dict, List, Any
 
@@ -114,6 +115,9 @@ class _PESAccumulator:
         return self.pusi_packet is not None and len(self.pes_data) > 0
 
 
+logger = logging.getLogger(__name__)
+
+
 class TSParser(BaseParser):
     """
     MPEG Transport Stream parser — yields one PacketInfo per 188-byte TS packet.
@@ -180,6 +184,7 @@ class TSParser(BaseParser):
             packet_size = 192
             ts_offset_in_packet = 4
 
+        logger.debug(f"TS packet size: {packet_size} bytes")
         file_offset = 0
 
         # Read in large chunks for performance (64KB ≈ 340 TS packets)

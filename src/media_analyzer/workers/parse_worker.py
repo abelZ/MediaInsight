@@ -1,5 +1,6 @@
 """Background parse worker thread."""
 
+import logging
 from PySide6.QtCore import QThread, Signal, QElapsedTimer
 from typing import List, Optional
 
@@ -9,6 +10,8 @@ from media_analyzer.parsers.base import BaseParser
 from media_analyzer.parsers.flv.parser import FLVParser
 from media_analyzer.parsers.ts.parser import TSParser
 from media_analyzer.parsers.mp4.parser import MP4Parser
+
+logger = logging.getLogger(__name__)
 
 
 # Emit packets to UI in batches for efficiency
@@ -59,6 +62,7 @@ class ParseWorker(QThread):
                 self._source.set_download_callback(self._on_download_progress)
 
             reader = self._source.open()
+            logger.info(f"Opened source: {self._source.name} ({self._source.size} bytes)")
 
             # Sniff format from first bytes (need enough for TS detection: 2 packets)
             header_peek = reader.read(400)
@@ -66,11 +70,15 @@ class ParseWorker(QThread):
 
             if FLVParser.sniff(header_peek):
                 self._parser = FLVParser()
+                logger.info("Detected format: FLV")
             elif TSParser.sniff(header_peek):
                 self._parser = TSParser()
+                logger.info("Detected format: MPEG-TS")
             elif MP4Parser.sniff(header_peek):
                 self._parser = MP4Parser()
+                logger.info("Detected format: MP4/MOV")
             else:
+                logger.warning(f"Unsupported format (magic: {header_peek[:4].hex()})")
                 self.error.emit(f"Unsupported format (magic: {header_peek[:4].hex()})")
                 return
 
@@ -127,9 +135,12 @@ class ParseWorker(QThread):
                 stream_info = self._parser.get_stream_info()
                 stream_info.source_path = self._source.name
                 stream_info.file_size = self._source.size
+                logger.info(f"Parse complete: format={stream_info.format_name}, "
+                            f"duration={stream_info.duration_ms}ms")
                 self.parse_finished.emit(stream_info)
 
         except Exception as e:
+            logger.error(f"Parse error: {e}", exc_info=True)
             self.error.emit(f"Parse error: {str(e)}")
 
     def stop(self):

@@ -9,6 +9,7 @@ Handles:
 - Protocol control message handling (SetChunkSize, WindowAckSize, etc.)
 """
 
+import logging
 import os
 import socket
 import struct
@@ -25,6 +26,8 @@ from media_analyzer.core.rtmp.constants import (
 )
 from media_analyzer.core.rtmp.chunk import ChunkReader, ChunkWriter, RTMPMessage
 from media_analyzer.core.rtmp.amf0 import AMF0Encoder
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -267,11 +270,16 @@ class RTMPClient:
             # Send any pending protocol responses before reading more data
             self._flush_pending_responses()
 
+            # Re-check socket (may have been disconnected by another thread)
+            sock = self._socket
+            if not sock or not self._connected:
+                return None
+
             try:
-                data = self._socket.recv(4096)
+                data = sock.recv(4096)
             except socket.timeout:
                 continue
-            except (OSError, ConnectionError):
+            except (OSError, ConnectionError, AttributeError):
                 self._connected = False
                 return None
 
@@ -378,16 +386,19 @@ class RTMPClient:
         if msg.type_id == MessageType.SET_CHUNK_SIZE:
             if len(msg.payload) >= 4:
                 new_size = struct.unpack(">I", msg.payload[:4])[0]
+                logger.debug(f"Server SetChunkSize: {new_size}")
                 self._chunk_reader.set_chunk_size(new_size)
 
         elif msg.type_id == MessageType.WINDOW_ACK_SIZE:
             if len(msg.payload) >= 4:
                 self._window_ack_size = struct.unpack(">I", msg.payload[:4])[0]
+                logger.debug(f"Server WindowAckSize: {self._window_ack_size}")
 
         elif msg.type_id == MessageType.SET_PEER_BANDWIDTH:
             # Update window ack size; defer response to avoid send during recv
             if len(msg.payload) >= 4:
                 size = struct.unpack(">I", msg.payload[:4])[0]
+                logger.debug(f"Server SetPeerBandwidth: {size}")
                 self._window_ack_size = size
                 self._pending_ack_size = size  # Will be sent before next recv
 

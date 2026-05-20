@@ -1,5 +1,6 @@
 """HLS segment download and parse worker."""
 
+import logging
 import urllib.request
 import urllib.error
 from typing import List, Optional
@@ -12,6 +13,8 @@ from media_analyzer.parsers.base import BaseParser
 from media_analyzer.parsers.flv.parser import FLVParser
 from media_analyzer.parsers.ts.parser import TSParser
 from media_analyzer.parsers.mp4.parser import MP4Parser
+
+logger = logging.getLogger(__name__)
 
 
 # Batching (same as ParseWorker)
@@ -47,9 +50,11 @@ class HLSSegmentWorker(QThread):
     def run(self):
         try:
             # Step 1: Download segment
+            logger.info(f"Downloading HLS segment: {self._url}")
             data = self._download()
             if not data or not self._running:
                 return
+            logger.info(f"Segment downloaded: {len(data)} bytes")
 
             # Step 2: Create in-memory source
             filename = self._url.split("/")[-1].split("?")[0]
@@ -63,11 +68,15 @@ class HLSSegmentWorker(QThread):
             parser: Optional[BaseParser] = None
             if TSParser.sniff(header_peek):
                 parser = TSParser()
+                logger.debug("Segment format: MPEG-TS")
             elif MP4Parser.sniff(header_peek):
                 parser = MP4Parser()
+                logger.debug("Segment format: MP4/fMP4")
             elif FLVParser.sniff(header_peek):
                 parser = FLVParser()
+                logger.debug("Segment format: FLV")
             else:
+                logger.warning(f"Unknown segment format (magic: {header_peek[:4].hex()})")
                 self.error.emit(
                     f"Unknown segment format (magic: {header_peek[:4].hex()})")
                 return

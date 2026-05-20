@@ -1,5 +1,6 @@
 """FLV format parser - raw byte-level parsing without ffmpeg."""
 
+import logging
 import struct
 from typing import Generator, BinaryIO, Optional, Dict, Any
 
@@ -17,6 +18,8 @@ from media_analyzer.parsers.h264.pps import parse_pps
 from media_analyzer.parsers.h265.vps import parse_hevc_vps
 from media_analyzer.parsers.h265.sps import parse_hevc_sps
 from media_analyzer.parsers.h265.pps import parse_hevc_pps
+
+logger = logging.getLogger(__name__)
 
 
 class FLVParseError(Exception):
@@ -110,6 +113,8 @@ class FLVParser(BaseParser):
             raise FLVParseError("File too short for FLV header")
 
         self.parse_header(header_data)
+        logger.debug(f"FLV header: v{self._header.version}, "
+                     f"audio={self._header.has_audio}, video={self._header.has_video}")
 
         # Yield FLV header as the first pseudo-tag (index 0)
         header_packet = PacketInfo(

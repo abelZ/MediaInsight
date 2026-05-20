@@ -6,11 +6,14 @@ Yields one PacketInfo per box in depth-first order.
 Reference: ISO/IEC 14496-12 (ISO Base Media File Format)
 """
 
+import logging
 import struct
 from typing import Generator, BinaryIO, Optional, Dict, List, Any
 
 from media_analyzer.parsers.base import BaseParser
 from media_analyzer.core.models import PacketInfo, StreamInfo, TagType
+
+logger = logging.getLogger(__name__)
 
 
 # Container boxes that should be recursed into
@@ -1124,16 +1127,21 @@ class MP4Parser(BaseParser):
                 self._current_track["stco"] = offsets
         elif box_type == b'stsz' and self._current_track is not None:
             source.seek(payload_offset)
-            raw = source.read(min(payload_size, 131072))
-            if len(raw) >= 12:
-                sample_size = struct.unpack(">I", raw[4:8])[0]
-                sample_count = struct.unpack(">I", raw[8:12])[0]
+            # Read header first (12 bytes: version/flags + sample_size + sample_count)
+            hdr = source.read(12)
+            if len(hdr) >= 12:
+                sample_size = struct.unpack(">I", hdr[4:8])[0]
+                sample_count = struct.unpack(">I", hdr[8:12])[0]
                 if sample_size != 0:
-                    self._current_track["stsz"] = [sample_size] * min(sample_count, 50000)
+                    # Fixed size: all samples have the same size
+                    self._current_track["stsz"] = [sample_size] * sample_count
                 else:
+                    # Variable size: read all sample sizes
+                    needed = sample_count * 4
+                    raw = source.read(needed)
                     sizes = []
                     for i in range(sample_count):
-                        pos = 12 + i * 4
+                        pos = i * 4
                         if pos + 4 > len(raw):
                             break
                         sizes.append(struct.unpack(">I", raw[pos:pos+4])[0])
@@ -1166,12 +1174,14 @@ class MP4Parser(BaseParser):
                 self._current_track["stss"] = sync
         elif box_type == b'stts' and self._current_track is not None:
             source.seek(payload_offset)
-            raw = source.read(min(payload_size, 131072))
-            if len(raw) >= 8:
-                count = struct.unpack(">I", raw[4:8])[0]
+            hdr = source.read(8)  # version/flags(4) + entry_count(4)
+            if len(hdr) >= 8:
+                count = struct.unpack(">I", hdr[4:8])[0]
+                needed = count * 8
+                raw = source.read(needed)
                 entries = []
                 for i in range(count):
-                    pos = 8 + i * 8
+                    pos = i * 8
                     if pos + 8 > len(raw):
                         break
                     sc = struct.unpack(">I", raw[pos:pos+4])[0]

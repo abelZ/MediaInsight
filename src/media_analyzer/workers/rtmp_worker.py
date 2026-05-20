@@ -5,6 +5,7 @@ receives media data, and emits packets for both RTMP-level
 and FLV-level views.
 """
 
+import logging
 import struct
 import time
 from typing import List, Optional, Tuple, Dict, Any
@@ -18,6 +19,8 @@ from media_analyzer.core.rtmp.constants import (
     MessageType, MESSAGE_TYPE_LABELS,
     RTMP_HANDSHAKE_SIZE,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Batching parameters (same philosophy as ParseWorker)
@@ -123,7 +126,9 @@ class RTMPWorker(QThread):
 
             # --- Phase 1: Connect ---
             self.state_changed.emit("connecting")
+            logger.info(f"RTMP connecting to {self._client.url.host}:{self._client.url.port}")
             self._client.connect()
+            logger.info("TCP connection established")
 
             if not self._running:
                 return
@@ -131,46 +136,57 @@ class RTMPWorker(QThread):
             # --- Phase 2: Handshake ---
             self.state_changed.emit("handshake")
             hs = self._client.handshake()
+            logger.info("RTMP handshake completed")
             self._emit_handshake_packets(hs)
 
             if not self._running:
                 return
 
             # --- Phase 3: Connect command ---
+            logger.debug(f"Sending connect command (app={self._client.url.app})")
             self._client.send_connect()
 
             # Read responses until we get _result for connect
             if not self._wait_for_connect_result():
                 return
+            logger.info("Connect command accepted")
 
             if not self._running:
                 return
 
             # --- Phase 4: CreateStream ---
+            logger.debug("Sending createStream command")
             self._client.send_create_stream()
 
             # Wait for createStream result
             if not self._wait_for_create_stream_result():
                 return
+            logger.info("createStream accepted")
 
             if not self._running:
                 return
 
             # --- Phase 5: Play ---
+            logger.info(f"Sending play command (stream={self._client.url.stream})")
             self._client.send_set_buffer_length(self._client._msg_stream_id, 1000)
             self._client.send_play()
 
             self.state_changed.emit("playing")
+            logger.info("RTMP playback started — receiving media data")
 
             # --- Phase 6: Receive loop ---
             self._recv_loop(timer)
 
         except Exception as e:
-            self.state_changed.emit("error")
-            self.error.emit(f"RTMP error: {str(e)}")
+            # Only emit error if not a user-initiated stop
+            if self._running:
+                logger.error(f"RTMP error: {e}", exc_info=True)
+                self.state_changed.emit("error")
+                self.error.emit(f"RTMP error: {str(e)}")
         finally:
             if self._client:
                 self._client.disconnect()
+            logger.info(f"RTMP session ended (rtmp={self._rtmp_index} pkts, flv={self._flv_index} tags)")
             self.state_changed.emit("disconnected")
 
     def _recv_loop(self, timer: QElapsedTimer):
