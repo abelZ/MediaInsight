@@ -42,6 +42,11 @@ try:
         elif sys.platform == "darwin":
             _frozen_libvlc = _os.path.join(_meipass, "vlc", "lib", "libvlc.dylib")
             if _os.path.isfile(_frozen_libvlc):
+                # Pre-load libvlccore (libvlc depends on it via @rpath)
+                import ctypes as _ctypes
+                _frozen_vlccore = _os.path.join(_meipass, "vlc", "lib", "libvlccore.dylib")
+                if _os.path.isfile(_frozen_vlccore):
+                    _ctypes.CDLL(_frozen_vlccore)
                 _os.environ['PYTHON_VLC_LIB_PATH'] = _frozen_libvlc
                 _plugins = _os.path.join(_meipass, "vlc", "plugins")
                 if _os.path.isdir(_plugins):
@@ -63,6 +68,12 @@ try:
             # Windows: add to DLL search path
             if sys.platform == "win32":
                 _os.add_dll_directory(_vlc_vendor_path)
+            # macOS: pre-load libvlccore (libvlc depends on it via @rpath)
+            elif sys.platform == "darwin":
+                import ctypes as _ctypes
+                _vlccore_path = _os.path.join(_vlc_vendor_path, "lib", "libvlccore.dylib")
+                if _os.path.isfile(_vlccore_path):
+                    _ctypes.CDLL(_vlccore_path)
 
     import vlc
     HAS_VLC = True
@@ -256,6 +267,11 @@ class PlayerPage(QWidget):
 
         # Build VLC arguments based on settings
         args = ["--quiet", "--no-video-title-show", "--no-stats"]
+
+        # macOS: prevent VLC's native interface plugin (libmacosx_plugin) from
+        # hijacking the Cocoa event loop — it conflicts with Qt and causes deadlock
+        if sys.platform == "darwin":
+            args.append("--intf=dummy")
 
         # Decode mode
         if self._decode_combo.currentIndex() == 1:
