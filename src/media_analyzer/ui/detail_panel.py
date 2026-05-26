@@ -522,11 +522,21 @@ class DetailPanelWidget(QWidget):
         title = f"{box_type}"
         if desc:
             title += f" ({desc})"
+
+        # Header layout: MP4 = [size(4)][type(4)], RIFF/WAV = [type(4)][size(4)]
+        is_riff = d.get("riff_layout", False)
+        if is_riff:
+            type_range = (0, 4)
+            size_range = (4, 4)
+        else:
+            type_range = (4, 4)
+            size_range = (0, 4)
+
         self._add_field(box_hdr, "Type", title,
-                       byte_range=(4, 4))
+                       byte_range=type_range)
         self._add_field(box_hdr, "Total Size",
                        f"{packet.tag_total_size:,} bytes",
-                       byte_range=(0, 4))
+                       byte_range=size_range)
         self._add_field(box_hdr, "Payload Size",
                        f"{packet.data_size:,} bytes")
         self._add_field(box_hdr, "Offset",
@@ -547,7 +557,11 @@ class DetailPanelWidget(QWidget):
             fields_item = QTreeWidgetItem(self._tree, ["Fields", ""])
             fields_item.setExpanded(True)
 
+            # Get byte_ranges mapping if available (field_name -> (offset, length))
+            byte_ranges = d.get("byte_ranges", {})
+
             for key, value in fields.items():
+                br = byte_ranges.get(key)  # May be None
                 if isinstance(value, dict):
                     sub_item = QTreeWidgetItem(fields_item,
                         [str(key), f"({len(value)} fields)"])
@@ -603,7 +617,8 @@ class DetailPanelWidget(QWidget):
                             self._add_field(sub_item, "...",
                                           f"({len(value) - 20} more)")
                 else:
-                    self._add_field(fields_item, str(key), self._format_value(value))
+                    self._add_field(fields_item, str(key), self._format_value(value),
+                                    byte_range=br)
 
     def _show_rtmp_packet_details(self, packet: PacketInfo) -> None:
         """Show RTMP protocol packet details."""

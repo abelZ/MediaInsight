@@ -91,8 +91,18 @@ class _MediaInfoWorker(QThread):
 
     def run(self):
         try:
+            import os
             from pymediainfo import MediaInfo
-            media_info = MediaInfo.parse(self._file_path)
+            # Suppress native C library warnings (TagLib etc.) by redirecting fd 2
+            stderr_fd = os.dup(2)
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull_fd, 2)
+            try:
+                media_info = MediaInfo.parse(self._file_path)
+            finally:
+                os.dup2(stderr_fd, 2)
+                os.close(stderr_fd)
+                os.close(devnull_fd)
             self.finished.emit(media_info)
         except Exception:
             self.finished.emit(None)

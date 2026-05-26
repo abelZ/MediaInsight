@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         self._nav_bar.addTab("Analyzer")
         self._nav_bar.addTab("Bitrate")
         self._nav_bar.addTab("Timestamp")
+        self._nav_bar.addTab("Audio")
         self._nav_bar.addTab("Player")
         self._nav_bar.addTab("Log")
         self._nav_bar.setExpanding(False)
@@ -139,12 +140,17 @@ class MainWindow(QMainWindow):
         timestamp_placeholder = QWidget()
         self._pages.addWidget(timestamp_placeholder)
 
-        # --- Page 3: Player (lazy-loaded) ---
+        # --- Page 3: Audio (lazy-loaded) ---
+        self._audio_page = None
+        audio_placeholder = QWidget()
+        self._pages.addWidget(audio_placeholder)
+
+        # --- Page 4: Player (lazy-loaded) ---
         self._player_page = None
         player_placeholder = QWidget()  # Placeholder until first use
         self._pages.addWidget(player_placeholder)
 
-        # --- Page 4: Log (created immediately to capture from start) ---
+        # --- Page 5: Log (created immediately to capture from start) ---
         from media_analyzer.ui.log_page import LogPage
         self._log_page = LogPage()
         self._pages.addWidget(self._log_page)
@@ -345,7 +351,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Media File",
             "",
-            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov *.webm *.mkv *.mka);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;WebM/MKV Files (*.webm *.mkv *.mka);;All Files (*)"
+            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov *.webm *.mkv *.mka *.wav);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;WebM/MKV Files (*.webm *.mkv *.mka);;WAV Files (*.wav);;All Files (*)"
         )
         if path:
             logger.info(f"Opening file: {path}")
@@ -822,6 +828,11 @@ class MainWindow(QMainWindow):
             self._ensure_timestamp_page()
             self._load_timestamp_data()
         elif index == 3:
+            # Audio page — lazy load
+            self._ensure_audio_page()
+            if self._audio_page and self._current_file_path:
+                self._audio_page.load_file(self._current_file_path)
+        elif index == 4:
             # Player page — lazy load
             self._ensure_player_page()
             # Pass URL/path + source for MediaInfo temp file fallback
@@ -895,6 +906,9 @@ class MainWindow(QMainWindow):
         if self._timestamp_page:
             self._timestamp_page.clear()  # Also stops live mode
 
+        if self._audio_page:
+            self._audio_page.clear()
+
     def _ensure_bitrate_page(self):
         """Create the bitrate page on first use."""
         if self._bitrate_page is not None:
@@ -956,17 +970,29 @@ class MainWindow(QMainWindow):
             packets = self._all_packets
             self._timestamp_page.load_packets(packets, self._stream_info)
 
+    def _ensure_audio_page(self):
+        """Create the audio page on first use."""
+        if self._audio_page is not None:
+            return
+        from media_analyzer.ui.audio_page import AudioPage
+        self._audio_page = AudioPage()
+        # Replace placeholder at index 3
+        old = self._pages.widget(3)
+        self._pages.removeWidget(old)
+        old.deleteLater()
+        self._pages.insertWidget(3, self._audio_page)
+
     def _ensure_player_page(self):
         """Create the player page on first use."""
         if self._player_page is not None:
             return
         from media_analyzer.ui.player_page import PlayerPage
         self._player_page = PlayerPage()
-        # Replace placeholder at index 3
-        old = self._pages.widget(3)
+        # Replace placeholder at index 4
+        old = self._pages.widget(4)
         self._pages.removeWidget(old)
         old.deleteLater()
-        self._pages.insertWidget(3, self._player_page)
+        self._pages.insertWidget(4, self._player_page)
 
     # --- View Switching ---
 
@@ -1021,36 +1047,38 @@ class MainWindow(QMainWindow):
             return self._ts_tabs.currentIndex() == 1
         return False
 
-    def _swap_to_box_tree_view(self):
-        """Replace the left panel with a tabbed view (Tree + Frames) for MP4/WebM/MKV."""
+    def _swap_to_box_tree_view(self, with_frame_view: bool = True):
+        """Replace the left panel with tree view (+ optional Frame tab)."""
         from PySide6.QtWidgets import QTabWidget
         from media_analyzer.ui.box_tree_view import BoxTreeView
 
         if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             return  # Already in box/frame mode
 
-        # Create tabbed container with bottom tabs
-        self._container_tabs = QTabWidget()
-        self._container_tabs.setTabPosition(QTabWidget.TabPosition.South)
-
-        # Tab 0: Tree view
         self._box_tree_view = BoxTreeView()
         self._box_tree_view.box_selected.connect(self._on_packet_selected)
-        self._container_tabs.addTab(self._box_tree_view, "Tree View")
 
-        # Tab 1: Frame view (table with frame-level columns)
-        self._frame_model = PacketTableModel(self)
-        self._frame_model.set_column_mode("frame")
-        self._frame_view = PacketTableView(self._frame_model)
-        self._frame_view.packet_selected.connect(self._on_packet_selected)
-        self._container_tabs.addTab(self._frame_view, "Frame View")
+        if with_frame_view:
+            # Tabbed container: Tree View + Frame View
+            self._container_tabs = QTabWidget()
+            self._container_tabs.setTabPosition(QTabWidget.TabPosition.South)
+            self._container_tabs.addTab(self._box_tree_view, "Tree View")
 
-        self._container_tabs.currentChanged.connect(self._on_container_tab_changed)
+            self._frame_model = PacketTableModel(self)
+            self._frame_model.set_column_mode("frame")
+            self._frame_view = PacketTableView(self._frame_model)
+            self._frame_view.packet_selected.connect(self._on_packet_selected)
+            self._container_tabs.addTab(self._frame_view, "Frame View")
 
-        # Hide table, show tabbed view in the same splitter position
-        self._table_view.hide()
-        self._main_splitter.insertWidget(0, self._container_tabs)
-        # Splitter now has 3 widgets: [container_tabs, table_view(hidden), right_splitter]
+            self._container_tabs.currentChanged.connect(self._on_container_tab_changed)
+
+            self._table_view.hide()
+            self._main_splitter.insertWidget(0, self._container_tabs)
+        else:
+            # Tree-only mode (e.g. WAV — no frame concept)
+            self._table_view.hide()
+            self._main_splitter.insertWidget(0, self._box_tree_view)
+
         self._main_splitter.setSizes([800, 0, 450])
 
     def _swap_to_table_view(self):
@@ -1264,8 +1292,10 @@ class MainWindow(QMainWindow):
                 # TS stream — create tabbed Packet/PES view
                 self._swap_to_ts_tabbed_view()
             elif first_pkt.script_data and ("box_type" in first_pkt.script_data):
-                # MP4 or WebM/MKV — swap to box tree view
-                self._swap_to_box_tree_view()
+                # MP4/WebM/MKV/WAV — swap to tree view
+                # WAV (riff_layout) gets tree only; MP4/WebM get tree + frame view
+                has_frame_view = not first_pkt.script_data.get("riff_layout", False)
+                self._swap_to_box_tree_view(with_frame_view=has_frame_view)
             else:
                 # FLV — use FLV columns
                 self._table_view.set_flv_view()
@@ -1588,4 +1618,6 @@ class MainWindow(QMainWindow):
             self._rtmp_worker.wait(3000)
         if self._player_page:
             self._player_page.cleanup()
+        if self._audio_page:
+            self._audio_page.cleanup()
         event.accept()

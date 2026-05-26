@@ -86,6 +86,8 @@ hiddenimports = [
     'media_analyzer.parsers.ebml',
     'media_analyzer.parsers.ebml.parser',
     'media_analyzer.parsers.ebml.elements',
+    'media_analyzer.parsers.wav',
+    'media_analyzer.parsers.wav.parser',
     'media_analyzer.parsers.h264',
     'media_analyzer.parsers.h264.bitreader',
     'media_analyzer.parsers.h264.sps',
@@ -113,6 +115,7 @@ hiddenimports = [
     'media_analyzer.ui.bitrate_page',
     'media_analyzer.ui.timestamp_page',
     'media_analyzer.ui.log_page',
+    'media_analyzer.ui.audio_page',
     'media_analyzer.ui.rtmp_view',
     'media_analyzer.ui.rtmp_control_bar',
     'media_analyzer.ui.hls_view',
@@ -122,6 +125,7 @@ hiddenimports = [
     'media_analyzer.workers.parse_worker',
     'media_analyzer.workers.rtmp_worker',
     'media_analyzer.workers.hls_worker',
+    'media_analyzer.workers.audio_decode_worker',
     # Third-party
     'pymediainfo',
 ]
