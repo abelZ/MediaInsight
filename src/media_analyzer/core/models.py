@@ -33,6 +33,8 @@ class VideoCodec(IntEnum):
     AVC = 7        # H.264
     HEVC = 12      # H.265 (enhanced FLV)
     AV1 = 13      # AV1 (enhanced FLV)
+    VP8 = 14      # WebM/MKV
+    VP9 = 15      # WebM/MKV
 
 
 class AudioCodec(IntEnum):
@@ -50,6 +52,8 @@ class AudioCodec(IntEnum):
     SPEEX = 11
     MP3_8K = 14
     DEVICE_SPECIFIC = 15
+    VORBIS = 16    # WebM/MKV
+    OPUS = 17      # WebM/MKV
 
 
 class AVCPacketType(IntEnum):
@@ -244,7 +248,9 @@ class PacketInfo:
             return self.video_codec.name
         elif self.audio_codec is not None:
             return self.audio_codec.name
-        # Fallback for TS streams: use stream_type_name from script_data
+        # Fallback: codec_name in script_data (used by EBML/TS parsers)
+        elif self.script_data and "codec_name" in self.script_data:
+            return self.script_data["codec_name"]
         elif self.script_data and "stream_type_name" in self.script_data:
             return self.script_data["stream_type_name"]
         return ""

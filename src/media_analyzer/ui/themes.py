@@ -580,19 +580,9 @@ QMenu::separator {{
     margin: 4px 10px;
 }}
 QMenu::indicator {{
-    width: 14px;
-    height: 14px;
+    width: 16px;
+    height: 16px;
     margin-left: 4px;
-}}
-QMenu::indicator:checked {{
-    background-color: {theme.selection_bg};
-    border: 1px solid {theme.border_light};
-    border-radius: 2px;
-}}
-QMenu::indicator:unchecked {{
-    background-color: {theme.bg_tertiary};
-    border: 1px solid {theme.border};
-    border-radius: 2px;
 }}
 
 /* Status Bar */

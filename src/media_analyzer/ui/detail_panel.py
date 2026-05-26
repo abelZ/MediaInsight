@@ -106,7 +106,10 @@ class DetailPanelWidget(QWidget):
 
         # MP4 box (identified by script_data containing "box_type" key)
         if packet.script_data and "box_type" in packet.script_data:
-            self._show_mp4_box_details(packet)
+            if packet.script_data.get("ebml_id") is not None:
+                self._show_ebml_element_details(packet)
+            else:
+                self._show_mp4_box_details(packet)
             return
 
         #
@@ -975,6 +978,133 @@ class DetailPanelWidget(QWidget):
                     self._add_field(sub_item, f"[{i}]", self._format_value(v))
             else:
                 self._add_field(parent, str(key), self._format_value(value))
+
+    def _show_ebml_element_details(self, packet: PacketInfo) -> None:
+        """Display detailed EBML element information."""
+        d = packet.script_data
+        elem_name = d.get("box_type", "Unknown")
+        elem_id = d.get("ebml_id", 0)
+        depth = d.get("depth", 0)
+        detail = d.get("detail", "")
+        is_container = d.get("is_container", False)
+
+        # --- Element Header ---
+        hdr_item = QTreeWidgetItem(self._tree, ["Element Header", ""])
+        hdr_item.setExpanded(True)
+
+        self._add_field(hdr_item, "Name", elem_name)
+        self._add_field(hdr_item, "Element ID", f"0x{elem_id:X}")
+        self._add_field(hdr_item, "Data Size", f"{packet.data_size:,} bytes")
+        self._add_field(hdr_item, "Total Size", f"{packet.tag_total_size:,} bytes (incl. header)")
+        self._add_field(hdr_item, "Offset", f"0x{packet.offset:08X} ({packet.offset:,})")
+        self._add_field(hdr_item, "Depth", str(depth))
+        if is_container:
+            self._add_field(hdr_item, "Type", "Container (has children)")
+        else:
+            self._add_field(hdr_item, "Type", "Leaf element")
+
+        # --- Element Value ---
+        if detail:
+            val_item = QTreeWidgetItem(self._tree, ["Value", ""])
+            val_item.setExpanded(True)
+            self._add_field(val_item, "Parsed", detail)
+
+            # Add type-specific interpretation
+            self._add_ebml_value_details(val_item, elem_id, detail, packet)
+
+        # --- Block details (for SimpleBlock/Block) ---
+        if d.get("ebml_track"):
+            track_num = d.get("track_num")
+            codec_name = d.get("codec_name", "")
+            cluster_ts = d.get("cluster_ts")
+            time_offset = d.get("time_offset")
+            keyframe = d.get("keyframe")
+
+            if track_num is not None or packet.timestamp > 0:
+                block_item = QTreeWidgetItem(self._tree, ["Block Info", ""])
+                block_item.setExpanded(True)
+
+                if track_num is not None:
+                    self._add_field(block_item, "Track Number", str(track_num))
+                if codec_name:
+                    self._add_field(block_item, "Codec", codec_name)
+                if packet.tag_type == TagType.VIDEO:
+                    self._add_field(block_item, "Stream Type", "Video")
+                elif packet.tag_type == TagType.AUDIO:
+                    self._add_field(block_item, "Stream Type", "Audio")
+                if cluster_ts is not None:
+                    self._add_field(block_item, "Cluster Timestamp", str(cluster_ts))
+                if time_offset is not None:
+                    self._add_field(block_item, "Block Time Offset", str(time_offset))
+                if packet.timestamp > 0:
+                    self._add_field(block_item, "Absolute Timestamp", f"{packet.timestamp} ms")
+                    ts_sec = packet.timestamp / 1000.0
+                    mins = int(ts_sec // 60)
+                    secs = ts_sec % 60
+                    self._add_field(block_item, "Time (formatted)",
+                                    f"{mins:02d}:{secs:06.3f}")
+                if keyframe is not None:
+                    self._add_field(block_item, "Keyframe", "Yes" if keyframe else "No")
+                if packet.frame_type == FrameType.KEY:
+                    self._add_field(block_item, "Frame Type", "I (IDR)")
+                elif packet.frame_type == FrameType.INTER:
+                    self._add_field(block_item, "Frame Type", "P/B (Inter)")
+                self._add_field(block_item, "Frame Size", f"{packet.data_size:,} bytes")
+
+    def _add_ebml_value_details(self, parent: QTreeWidgetItem, elem_id: int,
+                                detail: str, packet: PacketInfo) -> None:
+        """Add type-specific value interpretation for EBML elements."""
+        from media_analyzer.parsers.ebml.elements import (
+            TIMESTAMP_SCALE, DURATION, TRACK_TYPE, CODEC_ID,
+            DOC_TYPE, DEFAULT_DURATION,
+        )
+
+        if elem_id == TIMESTAMP_SCALE:
+            try:
+                ns = int(detail.split()[0])
+                ms = ns / 1_000_000
+                self._add_field(parent, "Milliseconds", f"{ms:.3f} ms per unit")
+                if ms == 1.0:
+                    self._add_field(parent, "Note", "Default (1ms precision)")
+            except (ValueError, IndexError):
+                pass
+        elif elem_id == DURATION:
+            try:
+                val = float(detail)
+                # Duration is in TimestampScale units
+                self._add_field(parent, "Note", "In TimestampScale units")
+            except ValueError:
+                pass
+        elif elem_id == DEFAULT_DURATION:
+            try:
+                ns_str = detail.split()[0]
+                ns = int(ns_str)
+                fps = 1_000_000_000 / ns if ns > 0 else 0
+                self._add_field(parent, "Frame Rate", f"{fps:.3f} fps")
+            except (ValueError, IndexError, ZeroDivisionError):
+                pass
+        elif elem_id == TRACK_TYPE:
+            type_desc = {
+                "video": "Track contains video frames",
+                "audio": "Track contains audio samples",
+                "subtitle": "Track contains subtitle/caption data",
+                "complex": "Combined audio+video (e.g., DV)",
+            }
+            desc = type_desc.get(detail, "")
+            if desc:
+                self._add_field(parent, "Description", desc)
+        elif elem_id == CODEC_ID:
+            from media_analyzer.parsers.ebml.elements import CODEC_MAP
+            label = CODEC_MAP.get(detail, "")
+            if label:
+                self._add_field(parent, "Codec Name", label)
+            # Add codec family info
+            if detail.startswith("V_"):
+                self._add_field(parent, "Family", "Video codec")
+            elif detail.startswith("A_"):
+                self._add_field(parent, "Family", "Audio codec")
+            elif detail.startswith("S_"):
+                self._add_field(parent, "Family", "Subtitle codec")
 
     def _format_value(self, value: Any) -> str:
         if isinstance(value, float):

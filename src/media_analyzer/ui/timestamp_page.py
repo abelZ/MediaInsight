@@ -246,9 +246,13 @@ class TimestampPage(QWidget):
         # Detect format
         is_ts = False
         is_mp4 = False
+        is_ebml = False
         for p in packets[:20]:
             if p.script_data and "box_type" in p.script_data:
-                is_mp4 = True
+                if p.script_data.get("ebml_id") is not None:
+                    is_ebml = True
+                else:
+                    is_mp4 = True
                 break
             if p.script_data and "pid" in p.script_data:
                 is_ts = True
@@ -259,6 +263,7 @@ class TimestampPage(QWidget):
         elif is_ts:
             self._extract_ts(packets)
         else:
+            # FLV / RTMP / WebM/MKV — all have direct timestamp on packets
             self._extract_flv(packets)
 
     def _extract_flv(self, packets: List[PacketInfo]) -> None:

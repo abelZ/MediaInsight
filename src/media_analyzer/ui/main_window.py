@@ -41,10 +41,17 @@ class MainWindow(QMainWindow):
         self._rtmp_worker = None  # RTMPWorker instance (when RTMP active)
         self._stream_info: Optional[StreamInfo] = None
         self._current_packet: Optional[PacketInfo] = None
-        self._pes_view_active: bool = False
         self._current_pes_data: Optional[bytes] = None  # Cached PES for NALU click
         self._format_detected: bool = False  # Whether we've auto-switched view for this file
-        self._box_tree_view = None  # MP4 box tree widget (created on demand)
+        self._box_tree_view = None  # MP4/WebM box tree widget (created on demand)
+        self._container_tabs = None  # QTabWidget for tree/frame toggle
+        self._frame_model = None  # Frame view model
+        self._frame_view = None  # Frame view table
+        self._ts_tabs = None  # QTabWidget for TS Packet/PES toggle
+        self._ts_pkt_model = None
+        self._ts_pkt_view = None
+        self._ts_pes_model = None
+        self._ts_pes_view = None
         self._rtmp_view = None  # RTMPDualView widget (created on demand)
         self._hls_view = None  # HLS segment list view (created on demand)
         self._current_file_path: Optional[str] = None  # Current file path for player page
@@ -231,32 +238,6 @@ class MainWindow(QMainWindow):
         show_all_action.triggered.connect(self._show_all_filters)
         filter_menu.addAction(show_all_action)
 
-        # --- View Menu ---
-        view_menu = menubar.addMenu("View")
-
-        self._view_group = None  # Will hold QActionGroup for TS views
-
-        self._view_pkt_action = QAction("TS Packet View", self)
-        self._view_pkt_action.setCheckable(True)
-        self._view_pkt_action.setShortcut(QKeySequence("Ctrl+Shift+1"))
-        self._view_pkt_action.triggered.connect(self._switch_to_pkt_view)
-        self._view_pkt_action.setEnabled(False)  # Disabled until TS file detected
-        view_menu.addAction(self._view_pkt_action)
-
-        self._view_pes_action = QAction("TS PES View", self)
-        self._view_pes_action.setCheckable(True)
-        self._view_pes_action.setShortcut(QKeySequence("Ctrl+Shift+2"))
-        self._view_pes_action.triggered.connect(self._switch_to_pes_view)
-        self._view_pes_action.setEnabled(False)  # Disabled until TS file detected
-        view_menu.addAction(self._view_pes_action)
-
-        self._view_standard_action = QAction("Standard View", self)
-        self._view_standard_action.setCheckable(True)
-        self._view_standard_action.setChecked(True)
-        self._view_standard_action.setShortcut(QKeySequence("Ctrl+Shift+3"))
-        self._view_standard_action.triggered.connect(self._switch_to_standard_view)
-        view_menu.addAction(self._view_standard_action)
-
         # --- Theme Menu ---
         self._setup_theme_menu(menubar)
 
@@ -282,16 +263,18 @@ class MainWindow(QMainWindow):
             "<li>FLV (Flash Video)</li>"
             "<li>MPEG-TS (Transport Stream)</li>"
             "<li>MP4/MOV (ISO BMFF)</li>"
+            "<li>WebM/MKV (Matroska / EBML)</li>"
             "<li>RTMP / RTMPS (Live Stream)</li>"
             "<li>HLS / M3U8 (HTTP Live Streaming)</li>"
             "<li>HTTP/HTTPS progressive download</li>"
             "</ul>"
-            "<p><b>Features:</b> Packet analysis, PES reassembly, NALU parsing, "
-            "Bitrate chart, Video playback, MediaInfo display</p>"
+            "<p><b>Analysis:</b> Packet/Box/Element hierarchy, NALU parsing, "
+            "Bitrate chart, Timestamp chart, Video playback, MediaInfo</p>"
+            "<p><b>Log:</b> Real-time application log with level filtering</p>"
             "<hr>"
             "<p><b>Developer:</b> Abel</p>"
             "<p><b>Email:</b> fylaotou@gmail.com</p>"
-            "<p><b>Version:</b> 0.3.0</p>"
+            "<p><b>Version:</b> 0.4.0</p>"
         )
 
     def _setup_statusbar(self):
@@ -362,7 +345,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Media File",
             "",
-            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;All Files (*)"
+            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov *.webm *.mkv *.mka);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;WebM/MKV Files (*.webm *.mkv *.mka);;All Files (*)"
         )
         if path:
             logger.info(f"Opening file: {path}")
@@ -577,8 +560,16 @@ class MainWindow(QMainWindow):
             self._rtmp_view.clear()
             return  # Already in RTMP mode
 
-        # Hide box tree if visible
-        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+        # Hide box tree / container tabs if visible
+        if hasattr(self, '_container_tabs') and self._container_tabs is not None:
+            self._container_tabs.hide()
+            self._container_tabs.setParent(None)
+            self._container_tabs.deleteLater()
+            self._container_tabs = None
+            self._box_tree_view = None
+            self._frame_model = None
+            self._frame_view = None
+        elif hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             self._box_tree_view.hide()
             self._box_tree_view.setParent(None)
             self._box_tree_view.deleteLater()
@@ -730,7 +721,15 @@ class MainWindow(QMainWindow):
             return  # Already in HLS mode
 
         # Hide other views
-        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+        if hasattr(self, '_container_tabs') and self._container_tabs is not None:
+            self._container_tabs.hide()
+            self._container_tabs.setParent(None)
+            self._container_tabs.deleteLater()
+            self._container_tabs = None
+            self._box_tree_view = None
+            self._frame_model = None
+            self._frame_view = None
+        elif hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             self._box_tree_view.hide()
             self._box_tree_view.setParent(None)
             self._box_tree_view.deleteLater()
@@ -770,22 +769,37 @@ class MainWindow(QMainWindow):
         self._main_splitter.setSizes([800, 450])
 
     def _apply_filters(self):
-        """Apply tag type filters to the table via the proxy model."""
-        self._table_view.proxy_model.set_filter(
-            show_video=self._filter_video_action.isChecked(),
-            show_audio=self._filter_audio_action.isChecked(),
-            show_script=self._filter_script_action.isChecked(),
-            only_idr=self._filter_idr_action.isChecked(),
-            only_has_sei=self._filter_sei_action.isChecked(),
+        """Apply tag type filters to all active table views."""
+        show_video = self._filter_video_action.isChecked()
+        show_audio = self._filter_audio_action.isChecked()
+        show_script = self._filter_script_action.isChecked()
+        only_idr = self._filter_idr_action.isChecked()
+        only_has_sei = self._filter_sei_action.isChecked()
+
+        filter_kwargs = dict(
+            show_video=show_video,
+            show_audio=show_audio,
+            show_script=show_script,
+            only_idr=only_idr,
+            only_has_sei=only_has_sei,
         )
-        # Update status with filter info
-        count = self._table_model.packet_count
-        if count > 0:
-            visible = self._table_view.proxy_model.rowCount()
-            if visible < count:
-                self._status_label.setText(f"{visible:,} / {count:,} tags (filtered)")
-            else:
-                self._status_label.setText(f"{count:,} tags")
+
+        # Apply to default table view (FLV mode)
+        self._table_view.proxy_model.set_filter(**filter_kwargs)
+
+        # Apply to TS views
+        if hasattr(self, '_ts_pkt_view') and self._ts_pkt_view is not None:
+            self._ts_pkt_view.proxy_model.set_filter(**filter_kwargs)
+        if hasattr(self, '_ts_pes_view') and self._ts_pes_view is not None:
+            self._ts_pes_view.proxy_model.set_filter(**filter_kwargs)
+
+        # Apply to MP4/WebM/MKV frame view
+        if hasattr(self, '_frame_view') and self._frame_view is not None:
+            self._frame_view.proxy_model.set_filter(**filter_kwargs)
+
+        # Apply to RTMP FLV view
+        if self._rtmp_view is not None:
+            self._rtmp_view._flv_view.proxy_model.set_filter(**filter_kwargs)
 
     def _show_all_filters(self):
         """Reset all filters to show everything."""
@@ -956,57 +970,246 @@ class MainWindow(QMainWindow):
 
     # --- View Switching ---
 
-    def _switch_to_pkt_view(self):
-        """Switch to TS Packet view (every 188-byte packet as a row, with CC column)."""
-        self._view_pkt_action.setChecked(True)
-        self._view_pes_action.setChecked(False)
-        self._view_standard_action.setChecked(False)
-        self._pes_view_active = False
-        self._table_view.set_ts_pkt_view(True)
+    def _swap_to_ts_tabbed_view(self):
+        """Replace left panel with a tabbed TS view (Packet View + PES View)."""
+        from PySide6.QtWidgets import QTabWidget
+        from media_analyzer.ui.packet_table.model import TS_PKT_COLUMNS
 
-    def _switch_to_pes_view(self):
-        """Switch to PES view (only frame-start packets shown)."""
-        self._view_pkt_action.setChecked(False)
-        self._view_pes_action.setChecked(True)
-        self._view_standard_action.setChecked(False)
-        self._pes_view_active = True
-        self._table_view.set_pes_view(True)
+        if hasattr(self, '_ts_tabs') and self._ts_tabs is not None:
+            return  # Already in TS tabbed mode
 
-    def _switch_to_standard_view(self):
-        """Switch to standard view (FLV-style, no TS columns)."""
-        self._view_pkt_action.setChecked(False)
-        self._view_pes_action.setChecked(False)
-        self._view_standard_action.setChecked(True)
-        self._pes_view_active = False
-        self._table_view.set_ts_pkt_view(False)
-        self._table_view.set_pes_view(False)
+        self._ts_tabs = QTabWidget()
+        self._ts_tabs.setTabPosition(QTabWidget.TabPosition.South)
+
+        # Tab 0: Packet View (all TS packets with PID/CC/PUSI columns)
+        self._ts_pkt_model = PacketTableModel(self)
+        self._ts_pkt_model.set_column_mode("ts_pkt")
+        self._ts_pkt_view = PacketTableView(self._ts_pkt_model)
+        self._ts_pkt_view._apply_column_widths(TS_PKT_COLUMNS)
+        self._ts_pkt_view.packet_selected.connect(self._on_packet_selected)
+        self._ts_tabs.addTab(self._ts_pkt_view, "Packet View")
+
+        # Tab 1: PES View (only PUSI=1 frame-start packets)
+        self._ts_pes_model = PacketTableModel(self)
+        self._ts_pes_model.set_column_mode("ts_pkt")
+        self._ts_pes_model.set_pes_mode(True)
+        self._ts_pes_view = PacketTableView(self._ts_pes_model)
+        self._ts_pes_view._apply_column_widths(TS_PKT_COLUMNS)
+        self._ts_pes_view.packet_selected.connect(self._on_packet_selected)
+        self._ts_tabs.addTab(self._ts_pes_view, "PES View")
+
+        # Hide default table, show TS tabs
+        self._table_view.hide()
+        self._main_splitter.insertWidget(0, self._ts_tabs)
+        self._main_splitter.setSizes([800, 0, 450])
+
+    def _swap_from_ts_tabbed_view(self):
+        """Remove TS tabbed view and restore normal table."""
+        if hasattr(self, '_ts_tabs') and self._ts_tabs is not None:
+            self._ts_tabs.hide()
+            self._ts_tabs.setParent(None)
+            self._ts_tabs.deleteLater()
+            self._ts_tabs = None
+            self._ts_pkt_model = None
+            self._ts_pkt_view = None
+            self._ts_pes_model = None
+            self._ts_pes_view = None
+
+    def _is_pes_view_active(self) -> bool:
+        """Check if TS PES tab is currently selected."""
+        if hasattr(self, '_ts_tabs') and self._ts_tabs is not None:
+            return self._ts_tabs.currentIndex() == 1
+        return False
 
     def _swap_to_box_tree_view(self):
-        """Replace the left panel with a box tree view for MP4 files."""
+        """Replace the left panel with a tabbed view (Tree + Frames) for MP4/WebM/MKV."""
+        from PySide6.QtWidgets import QTabWidget
         from media_analyzer.ui.box_tree_view import BoxTreeView
 
         if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
-            return  # Already in box tree mode
+            return  # Already in box/frame mode
 
+        # Create tabbed container with bottom tabs
+        self._container_tabs = QTabWidget()
+        self._container_tabs.setTabPosition(QTabWidget.TabPosition.South)
+
+        # Tab 0: Tree view
         self._box_tree_view = BoxTreeView()
         self._box_tree_view.box_selected.connect(self._on_packet_selected)
+        self._container_tabs.addTab(self._box_tree_view, "Tree View")
 
-        # Hide table, show tree in the same splitter position
+        # Tab 1: Frame view (table with frame-level columns)
+        self._frame_model = PacketTableModel(self)
+        self._frame_model.set_column_mode("frame")
+        self._frame_view = PacketTableView(self._frame_model)
+        self._frame_view.packet_selected.connect(self._on_packet_selected)
+        self._container_tabs.addTab(self._frame_view, "Frame View")
+
+        self._container_tabs.currentChanged.connect(self._on_container_tab_changed)
+
+        # Hide table, show tabbed view in the same splitter position
         self._table_view.hide()
-        self._main_splitter.insertWidget(0, self._box_tree_view)
-        # Splitter now has 3 widgets: [box_tree_view, table_view(hidden), right_splitter]
+        self._main_splitter.insertWidget(0, self._container_tabs)
+        # Splitter now has 3 widgets: [container_tabs, table_view(hidden), right_splitter]
         self._main_splitter.setSizes([800, 0, 450])
 
     def _swap_to_table_view(self):
-        """Restore the table view (when switching from MP4 back to FLV/TS)."""
-        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+        """Restore the table view (when switching from any special mode)."""
+        # Clean up MP4/WebM container tabs
+        if hasattr(self, '_container_tabs') and self._container_tabs is not None:
+            self._container_tabs.hide()
+            self._container_tabs.setParent(None)
+            self._container_tabs.deleteLater()
+            self._container_tabs = None
+            self._box_tree_view = None
+            self._frame_model = None
+            self._frame_view = None
+        elif hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             self._box_tree_view.hide()
             self._box_tree_view.setParent(None)
             self._box_tree_view.deleteLater()
             self._box_tree_view = None
+        # Clean up TS tabs
+        self._swap_from_ts_tabbed_view()
         self._table_view.show()
         # Restore splitter proportions
         self._main_splitter.setSizes([800, 450])
+
+    def _on_container_tab_changed(self, index: int):
+        """Handle tab switch between Tree View and Frame View."""
+        if index == 1 and hasattr(self, '_frame_model') and self._frame_model is not None:
+            # Switching to Frame View — populate if empty
+            if self._frame_model.packet_count == 0:
+                self._populate_frame_view()
+
+    def _populate_frame_view(self):
+        """Build frame-level table from _all_packets or stream_info (MP4)."""
+        if not hasattr(self, '_frame_model') or self._frame_model is None:
+            return
+
+        from media_analyzer.core.models import TagType, FrameType
+
+        # Detect format: MP4 samples have timestamp=0, EBML blocks have timestamp>0
+        is_mp4 = False
+        for p in self._all_packets[:20]:
+            if p.script_data and "box_type" in p.script_data:
+                if p.script_data.get("ebml_id") is None:
+                    is_mp4 = True
+                break
+
+        if is_mp4:
+            self._populate_frame_view_mp4()
+        else:
+            self._populate_frame_view_ebml()
+
+    def _populate_frame_view_ebml(self):
+        """Frame view for WebM/MKV — use packets directly (they have timestamps)."""
+        from media_analyzer.core.models import TagType
+        frame_packets = []
+        frame_idx = 0
+        for pkt in self._all_packets:
+            if pkt.tag_type in (TagType.VIDEO, TagType.AUDIO) and pkt.timestamp >= 0:
+                # Skip non-frame elements (like cluster headers with ts=0 but no data)
+                if pkt.data_size <= 0:
+                    continue
+                fpkt = PacketInfo(
+                    index=frame_idx,
+                    tag_type=pkt.tag_type,
+                    timestamp=pkt.timestamp,
+                    data_size=pkt.data_size,
+                    offset=pkt.offset,
+                    stream_id=pkt.stream_id,
+                    tag_total_size=pkt.tag_total_size,
+                    frame_type=pkt.frame_type,
+                    video_codec=pkt.video_codec,
+                    audio_codec=pkt.audio_codec,
+                    composition_time=pkt.composition_time,
+                    script_data=pkt.script_data,
+                )
+                frame_packets.append(fpkt)
+                frame_idx += 1
+
+        if frame_packets:
+            self._frame_model.append_packets(frame_packets)
+
+    def _populate_frame_view_mp4(self):
+        """Frame view for MP4 — compute DTS from stts, sizes from stsz."""
+        from media_analyzer.core.models import TagType, FrameType
+
+        if not self._stream_info or not self._stream_info.metadata:
+            return
+
+        tracks = self._stream_info.metadata.get("tracks", [])
+        if not tracks:
+            return
+
+        # Build frame list from all tracks, sorted by DTS
+        all_frames = []
+        for track in tracks:
+            handler = track.get("handler", "")
+            is_video = handler in ("vide", "video")
+            is_audio = handler in ("soun", "sound")
+            if not is_video and not is_audio:
+                continue
+
+            timescale = track.get("timescale", 0)
+            if timescale <= 0:
+                continue
+
+            stts_entries = track.get("stts", [])
+            sample_sizes = track.get("stsz", [])
+            sync_set = track.get("stss", set())
+            codec_name = "H.264" if is_video else "AAC"  # Default labels
+
+            if not sample_sizes:
+                continue
+
+            # Compute DTS for each sample
+            dts = 0
+            sample_idx = 0
+            for entry in stts_entries:
+                if isinstance(entry, (list, tuple)):
+                    count, delta = entry[0], entry[1]
+                else:
+                    count = entry.get("count", 0)
+                    delta = entry.get("delta", 0)
+                for _ in range(count):
+                    if sample_idx >= len(sample_sizes):
+                        break
+                    dts_ms = int(dts * 1000 / timescale)
+                    size = sample_sizes[sample_idx]
+                    is_sync = (sample_idx + 1) in sync_set
+
+                    tag_type = TagType.VIDEO if is_video else TagType.AUDIO
+                    frame_type = None
+                    if is_video:
+                        frame_type = FrameType.KEY if is_sync else FrameType.INTER
+
+                    all_frames.append((dts_ms, tag_type, size, frame_type, codec_name))
+                    dts += delta
+                    sample_idx += 1
+
+        # Sort by DTS
+        all_frames.sort(key=lambda x: x[0])
+
+        # Build PacketInfo list
+        frame_packets = []
+        for idx, (dts_ms, tag_type, size, frame_type, codec_name) in enumerate(all_frames):
+            fpkt = PacketInfo(
+                index=idx,
+                tag_type=tag_type,
+                timestamp=dts_ms,
+                data_size=size,
+                offset=0,
+                stream_id=0,
+                tag_total_size=size,
+                frame_type=frame_type,
+                script_data={"codec_name": codec_name},
+            )
+            frame_packets.append(fpkt)
+
+        if frame_packets:
+            self._frame_model.append_packets(frame_packets)
 
     # --- Parsing ---
 
@@ -1031,7 +1234,8 @@ class MainWindow(QMainWindow):
         self._hex_view.clear()
         self._format_detected = False
 
-        # Restore table view if previously in box tree mode (MP4)
+        # Restore table view if previously in special mode (MP4/TS/WebM)
+        self._swap_from_ts_tabbed_view()
         self._swap_to_table_view()
 
         # Update UI state
@@ -1040,14 +1244,6 @@ class MainWindow(QMainWindow):
         self._stop_action.setEnabled(True)
         self._status_label.setText(f"Parsing: {source.name}...")
         self._info_label.setText("")
-
-        # Reset view state for new file
-        self._view_pkt_action.setEnabled(False)
-        self._view_pes_action.setEnabled(False)
-        self._view_pkt_action.setChecked(False)
-        self._view_pes_action.setChecked(False)
-        self._view_standard_action.setChecked(True)
-        self._pes_view_active = False
 
         # Start worker thread
         self._worker = ParseWorker(source, self)
@@ -1065,27 +1261,25 @@ class MainWindow(QMainWindow):
             self._format_detected = True
             first_pkt = packets[0]
             if first_pkt.script_data and "pid" in first_pkt.script_data:
-                # TS stream — enable TS view actions and switch to packet view
-                self._view_pkt_action.setEnabled(True)
-                self._view_pes_action.setEnabled(True)
-                self._switch_to_pkt_view()
-            elif first_pkt.script_data and "box_type" in first_pkt.script_data:
-                # MP4 — swap to box tree view
-                self._view_pkt_action.setEnabled(False)
-                self._view_pes_action.setEnabled(False)
+                # TS stream — create tabbed Packet/PES view
+                self._swap_to_ts_tabbed_view()
+            elif first_pkt.script_data and ("box_type" in first_pkt.script_data):
+                # MP4 or WebM/MKV — swap to box tree view
                 self._swap_to_box_tree_view()
             else:
-                # FLV — use FLV columns, disable TS-specific view options
-                self._view_pkt_action.setEnabled(False)
-                self._view_pes_action.setEnabled(False)
+                # FLV — use FLV columns
                 self._table_view.set_flv_view()
 
         # Route packets to appropriate view
         if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
-            # MP4 mode: send to box tree view
+            # MP4/WebM mode: send to box tree view
             self._box_tree_view.append_packets(packets)
+        elif hasattr(self, '_ts_tabs') and self._ts_tabs is not None:
+            # TS mode: send to both packet and PES models
+            self._ts_pkt_model.append_packets(packets)
+            self._ts_pes_model.append_packets(packets)
         else:
-            # FLV/TS mode: send to table model
+            # FLV mode: send to table model
             self._table_view.setUpdatesEnabled(False)
             self._table_model.append_packets(packets)
             self._table_view.setUpdatesEnabled(True)
@@ -1093,8 +1287,13 @@ class MainWindow(QMainWindow):
         # Always accumulate for bitrate analysis
         self._all_packets.extend(packets)
 
-        # Update status (lightweight — just show count)
-        count = self._table_model.packet_count
+        # Update status
+        if hasattr(self, '_ts_pkt_model') and self._ts_pkt_model is not None:
+            count = self._ts_pkt_model.packet_count
+        elif hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            count = len(self._all_packets)
+        else:
+            count = self._table_model.packet_count
         self._status_label.setText(f"{count:,} tags loaded")
 
     def _on_progress(self, current: int, total: int):
@@ -1179,7 +1378,7 @@ class MainWindow(QMainWindow):
         if self._rtmp_worker and self._rtmp_view:
             # RTMP mode: read hex from worker's stored raw bytes
             self._show_rtmp_hex(packet)
-        elif self._pes_view_active and packet.script_data and packet.script_data.get("pusi"):
+        elif self._is_pes_view_active() and packet.script_data and packet.script_data.get("pusi"):
             self._show_pes_hex(packet)
         else:
             self._show_tag_hex(packet)
@@ -1208,7 +1407,7 @@ class MainWindow(QMainWindow):
 
         if self._worker and self._worker.source:
             try:
-                if self._pes_view_active and self._current_pes_data:
+                if self._is_pes_view_active() and self._current_pes_data:
                     # PES view: NALU offset is within ES data
                     # ES starts at _es_offset_in_pes within the PES data
                     es_offset = packet.script_data.get("_es_offset_in_pes", 0) if packet.script_data else 0

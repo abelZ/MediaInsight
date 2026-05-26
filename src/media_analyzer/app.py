@@ -1,13 +1,57 @@
 """Application setup and theme application."""
 
 import sys
-from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QPalette, QColor
-from PySide6.QtCore import Qt
+import platform
+from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleOption
+from PySide6.QtGui import QPalette, QColor, QPainter, QPen, QPixmap, QIcon
+from PySide6.QtCore import Qt, QRect
 
 from media_analyzer.ui.themes import (
     get_current_theme, generate_stylesheet, Theme
 )
+
+
+class CheckmarkStyle(QProxyStyle):
+    """Custom style that draws a checkmark (✓) for checked menu items on Windows,
+    matching macOS behavior instead of the default filled square."""
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element == QStyle.PrimitiveElement.PE_IndicatorMenuCheckMark:
+            # Draw a checkmark like macOS
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            rect = option.rect
+            # Use text color for the checkmark
+            color = option.palette.color(QPalette.ColorRole.Text)
+            pen = QPen(color)
+            pen.setWidth(2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+
+            # Draw checkmark path (✓ shape)
+            cx = rect.center().x()
+            cy = rect.center().y()
+            # Short stroke (down-left to center-bottom)
+            x1 = cx - 4
+            y1 = cy - 1
+            x2 = cx - 1
+            y2 = cy + 3
+            # Long stroke (center-bottom to upper-right)
+            x3 = cx + 5
+            y3 = cy - 4
+
+            from PySide6.QtCore import QPointF
+            from PySide6.QtGui import QPainterPath
+            path = QPainterPath()
+            path.moveTo(QPointF(x1, y1))
+            path.lineTo(QPointF(x2, y2))
+            path.lineTo(QPointF(x3, y3))
+            painter.drawPath(path)
+            painter.restore()
+            return
+
+        super().drawPrimitive(element, option, painter, widget)
 
 
 def create_application(argv=None) -> QApplication:
@@ -25,6 +69,10 @@ def create_application(argv=None) -> QApplication:
 
     # Use Fusion style for consistent cross-platform look
     app.setStyle("Fusion")
+
+    # On Windows: apply checkmark style for menu indicators (match macOS ✓)
+    if platform.system() == "Windows":
+        app.setStyle(CheckmarkStyle("Fusion"))
 
     # Apply default theme
     apply_theme(app, get_current_theme())

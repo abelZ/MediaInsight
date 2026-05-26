@@ -10,6 +10,7 @@ from media_analyzer.parsers.base import BaseParser
 from media_analyzer.parsers.flv.parser import FLVParser
 from media_analyzer.parsers.ts.parser import TSParser
 from media_analyzer.parsers.mp4.parser import MP4Parser
+from media_analyzer.parsers.ebml.parser import EBMLParser
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,9 @@ class ParseWorker(QThread):
             elif MP4Parser.sniff(header_peek):
                 self._parser = MP4Parser()
                 logger.info("Detected format: MP4/MOV")
+            elif EBMLParser.sniff(header_peek):
+                self._parser = EBMLParser()
+                logger.info("Detected format: WebM/MKV")
             else:
                 logger.warning(f"Unsupported format (magic: {header_peek[:4].hex()})")
                 self.error.emit(f"Unsupported format (magic: {header_peek[:4].hex()})")

@@ -38,6 +38,9 @@ class BitrateExtractor:
         # Detect format from first few packets
         for p in packets[:20]:
             if p.script_data and "box_type" in p.script_data:
+                if p.script_data.get("ebml_id") is not None:
+                    # WebM/MKV — use FLV-style extraction (direct timestamp + size)
+                    return BitrateExtractor._extract_flv(packets)
                 return BitrateExtractor._extract_mp4(packets, stream_info)
             if p.script_data and "pid" in p.script_data:
                 return BitrateExtractor._extract_ts(packets)

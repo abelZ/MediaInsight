@@ -57,6 +57,22 @@ TS_PKT_COLUMNS = [
     ("Detail",      "detail_label",     200),
 ]
 
+# Frame view columns (for MP4/WebM/MKV frame-level display)
+FRAME_COLUMNS = [
+    ("No.",         "index",            50),
+    ("Type",        "type_label",       60),
+    ("DTS",         "timestamp",        80),
+    ("PTS",         "pts",              80),
+    ("CTS",         "composition_time", 50),
+    ("Time",        "_time_human",      80),
+    ("Delta",       "_delta_ms",        50),
+    ("Size",        "data_size",        70),
+    ("Codec",       "codec_label",      90),
+    ("Frame",       "frame_label",      60),
+    ("Offset",      "offset",           90),
+    ("Detail",      "detail_label",     200),
+]
+
 # Row background colors by tag type (dark theme, subtle tints)
 # Very subtle color differences on a near-neutral dark base
 TYPE_BG_COLORS = {
@@ -147,7 +163,7 @@ class PacketTableModel(QAbstractTableModel):
         self._pusi_indices: List[int] = []  # Pre-built index of PUSI packet positions
 
     def set_column_mode(self, mode: str) -> None:
-        """Switch column layout. mode: 'flv', 'ts_pkt', 'rtmp', or 'standard'."""
+        """Switch column layout. mode: 'flv', 'ts_pkt', 'rtmp', 'frame', or 'standard'."""
         self.beginResetModel()
         if mode == "ts_pkt":
             self._columns = TS_PKT_COLUMNS
@@ -155,6 +171,8 @@ class PacketTableModel(QAbstractTableModel):
             self._columns = FLV_COLUMNS
         elif mode == "rtmp":
             self._columns = RTMP_COLUMNS
+        elif mode == "frame":
+            self._columns = FRAME_COLUMNS
         else:
             self._columns = COLUMNS
         self.endResetModel()
