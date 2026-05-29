@@ -384,6 +384,91 @@ def _make_colormap() -> List[QColor]:
 
 SPECTROGRAM_COLORMAP = _make_colormap()
 
+# Pre-computed numpy RGB array for fast colormap lookup (256 × 3, uint8)
+SPECTROGRAM_CMAP_ARRAY = np.array(
+    [[c.red(), c.green(), c.blue()] for c in SPECTROGRAM_COLORMAP],
+    dtype=np.uint8
+)
+
+
+def _apply_log_scale_func(spec_db: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Resample frequency axis to logarithmic scale (standalone function for threading).
+    Low frequencies get more resolution, high frequencies compressed.
+    spec_db shape: (n_freq, n_frames). Returns (n_log_bins, n_frames)."""
+    n_freq, n_frames = spec_db.shape
+    n_log_bins = 256  # Output frequency bins
+
+    max_freq = sample_rate / 2
+    min_freq = 20.0  # Start at 20Hz (avoid log(0))
+    log_freqs = np.logspace(np.log10(min_freq), np.log10(max_freq),
+                            n_log_bins + 1)
+
+    # Map log bins to FFT bins
+    fft_freqs = np.linspace(0, max_freq, n_freq)
+    log_spec = np.zeros((n_log_bins, n_frames), dtype=np.float32)
+
+    for m in range(n_log_bins):
+        f_low = log_freqs[m]
+        f_high = log_freqs[m + 1]
+        idx_low = int(np.searchsorted(fft_freqs, f_low))
+        idx_high = int(np.searchsorted(fft_freqs, f_high))
+        if idx_high > idx_low:
+            log_spec[m] = spec_db[idx_low:idx_high].max(axis=0)
+        elif idx_low < n_freq:
+            log_spec[m] = spec_db[min(idx_low, n_freq - 1)]
+
+    return log_spec
+
+
+def _compute_spectrogram_data(pcm: np.ndarray, sample_rate: int, channels: int,
+                              fft_size: int, hop_size: int, mode: str) -> List[np.ndarray]:
+    """Compute STFT magnitude spectrogram for each channel (module-level for threading).
+
+    Returns a list of uint8 numpy arrays (one per channel), shape (n_freq_bins, n_frames),
+    with values 0-255 representing normalized dB magnitude.
+    """
+    if pcm is None or len(pcm) == 0:
+        return []
+
+    n_fft = fft_size
+    hop = hop_size
+    window = np.hanning(n_fft).astype(np.float32)
+
+    spec_data = []
+
+    for ch in range(channels):
+        signal = pcm[:, ch]
+        n_frames = max(1, (len(signal) - n_fft) // hop + 1)
+
+        # Vectorized STFT: create strided frame view (no copy)
+        shape = (n_frames, n_fft)
+        strides = (signal.strides[0] * hop, signal.strides[0])
+        # Ensure we don't read past buffer
+        if (n_frames - 1) * hop + n_fft > len(signal):
+            pad_len = (n_frames - 1) * hop + n_fft - len(signal)
+            signal = np.pad(signal, (0, pad_len))
+        frames = np.lib.stride_tricks.as_strided(signal, shape=shape, strides=strides)
+
+        # Apply window and compute FFT in batch
+        windowed = frames * window[np.newaxis, :]
+        fft_result = np.fft.rfft(windowed, axis=1)
+        spec = np.abs(fft_result).T  # Shape: (n_fft//2+1, n_frames)
+
+        # Convert to dB
+        spec_db = 20 * np.log10(spec + 1e-10)
+
+        # Apply frequency scale
+        if mode == "log":
+            spec_db = _apply_log_scale_func(spec_db, sample_rate)
+
+        # Normalize to 0-255 for colormap (80dB dynamic range)
+        vmin = spec_db.max() - 80
+        vmax = spec_db.max()
+        spec_norm = np.clip((spec_db - vmin) / (vmax - vmin), 0, 1)
+        spec_data.append((spec_norm * 255).astype(np.uint8))
+
+    return spec_data
+
 
 class SpectrogramWidget(QWidget):
     """
@@ -424,7 +509,7 @@ class SpectrogramWidget(QWidget):
         self.setStyleSheet("background-color: #0a0a12;")
 
     def set_pcm_data(self, pcm: np.ndarray, sample_rate: int, channels: int):
-        """Set PCM data and compute spectrogram."""
+        """Set PCM data and start background spectrogram computation."""
         self._pcm = pcm
         self._sample_rate = sample_rate
         self._channels = channels
@@ -436,7 +521,45 @@ class SpectrogramWidget(QWidget):
         self._spec_data = None
 
         if self._total_samples > 0:
-            self._compute_spectrogram()
+            self._start_compute()
+        self.update()
+
+    def _start_compute(self):
+        """Start spectrogram computation in background thread."""
+        if hasattr(self, '_compute_thread') and self._compute_thread is not None:
+            self._compute_thread.quit()
+            self._compute_thread.wait(1000)
+
+        from PySide6.QtCore import QThread
+
+        class _SpecWorker(QThread):
+            finished = Signal(list)
+
+            def __init__(self, pcm, sr, channels, fft_size, hop_size, mode, parent=None):
+                super().__init__(parent)
+                self._pcm = pcm
+                self._sr = sr
+                self._channels = channels
+                self._fft_size = fft_size
+                self._hop_size = hop_size
+                self._mode = mode
+
+            def run(self):
+                result = _compute_spectrogram_data(
+                    self._pcm, self._sr, self._channels,
+                    self._fft_size, self._hop_size, self._mode)
+                self.finished.emit(result)
+
+        self._compute_thread = _SpecWorker(
+            self._pcm, self._sample_rate, self._channels,
+            self._fft_size, self._hop_size, self._spec_mode, self)
+        self._compute_thread.finished.connect(self._on_compute_done)
+        self._compute_thread.start()
+
+    def _on_compute_done(self, result: list):
+        """Handle background spectrogram computation result."""
+        self._spec_data = result
+        self._spec_image = None
         self.update()
 
     def set_channel_visible(self, channel: int, visible: bool):
@@ -452,7 +575,7 @@ class SpectrogramWidget(QWidget):
             self._spec_mode = mode
             self._spec_image = None
             if self._pcm is not None and len(self._pcm) > 0:
-                self._compute_spectrogram()
+                self._start_compute()
             self.update()
 
     def set_view_range(self, start: int, end: int):
@@ -467,73 +590,10 @@ class SpectrogramWidget(QWidget):
         self._cursor_pos = sample_index
         self.update()
 
-    def _compute_spectrogram(self):
-        """Compute STFT magnitude spectrogram for each channel."""
-        if self._pcm is None or len(self._pcm) == 0:
-            return
-
-        n_fft = self._fft_size
-        hop = self._hop_size
-        window = np.hanning(n_fft).astype(np.float32)
-
-        self._spec_data = []
-
-        for ch in range(self._channels):
-            signal = self._pcm[:, ch]
-            n_frames = max(1, (len(signal) - n_fft) // hop + 1)
-
-            # Compute magnitude spectrogram
-            spec = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.float32)
-            for i in range(n_frames):
-                start = i * hop
-                frame = signal[start:start + n_fft]
-                if len(frame) < n_fft:
-                    frame = np.pad(frame, (0, n_fft - len(frame)))
-                windowed = frame * window
-                fft_result = np.fft.rfft(windowed)
-                spec[:, i] = np.abs(fft_result)
-
-            # Convert to dB
-            spec_db = 20 * np.log10(spec + 1e-10)
-
-            # Apply frequency scale
-            if self._spec_mode == "log":
-                spec_db = self._apply_log_scale(spec_db)
-
-            # Normalize to 0-255 for colormap (80dB dynamic range)
-            vmin = spec_db.max() - 80
-            vmax = spec_db.max()
-            spec_norm = np.clip((spec_db - vmin) / (vmax - vmin), 0, 1)
-            self._spec_data.append((spec_norm * 255).astype(np.uint8))
-
-    def _apply_log_scale(self, spec_db: np.ndarray) -> np.ndarray:
-        """Resample frequency axis to logarithmic scale.
-        Low frequencies get more resolution, high frequencies compressed."""
-        n_freq, n_frames = spec_db.shape
-        n_log_bins = 256  # Output frequency bins
-
-        max_freq = self._sample_rate / 2
-        # Log scale: map from log(min_freq) to log(max_freq) uniformly
-        min_freq = 20.0  # Start at 20Hz (avoid log(0))
-        log_freqs = np.logspace(np.log10(min_freq), np.log10(max_freq),
-                                n_log_bins + 1)
-
-        # Map log bins to FFT bins
-        fft_freqs = np.linspace(0, max_freq, n_freq)
-        log_spec = np.zeros((n_log_bins, n_frames), dtype=np.float32)
-
-        for m in range(n_log_bins):
-            f_low = log_freqs[m]
-            f_high = log_freqs[m + 1]
-            idx_low = int(np.searchsorted(fft_freqs, f_low))
-            idx_high = int(np.searchsorted(fft_freqs, f_high))
-            if idx_high > idx_low:
-                # Use max to preserve peaks (not mean which smears energy)
-                log_spec[m] = spec_db[idx_low:idx_high].max(axis=0)
-            elif idx_low < n_freq:
-                log_spec[m] = spec_db[min(idx_low, n_freq - 1)]
-
-        return log_spec
+    def resizeEvent(self, event):
+        """Invalidate cached image on resize so it redraws at new size."""
+        self._spec_image = None
+        super().resizeEvent(event)
 
     def paintEvent(self, event: QPaintEvent):
         """Draw per-channel spectrogram images with cursor."""
@@ -568,26 +628,39 @@ class SpectrogramWidget(QWidget):
                 n_f = spec_ch.shape[0]
                 spec_view = spec_ch[:, frame_start:frame_end]
 
-                img = QImage(draw_w, n_f, QImage.Format.Format_RGB32)
-                img.fill(QColor(10, 10, 18))
-
                 is_enabled = self._channel_visible[ch] if ch < len(self._channel_visible) else True
 
-                for px in range(draw_w):
-                    frame_idx = px * view_frames // draw_w
-                    if frame_idx >= spec_view.shape[1]:
-                        frame_idx = spec_view.shape[1] - 1
-                    col = spec_view[:, frame_idx]
+                # Resample spec_view to draw_w columns using numpy indexing
+                frame_indices = np.minimum(
+                    np.arange(draw_w) * view_frames // draw_w,
+                    spec_view.shape[1] - 1
+                )
+                # Shape: (n_f, draw_w) — resampled spectrogram for display
+                resampled = spec_view[:, frame_indices]
+                # Flip frequency axis (high freq at top row)
+                resampled = resampled[::-1, :]
 
-                    for fy in range(n_f):
-                        val = col[n_f - 1 - fy]
-                        if is_enabled:
-                            color = SPECTROGRAM_COLORMAP[val]
-                        else:
-                            # Grayed out: use grayscale
-                            gray = val // 3
-                            color = QColor(gray, gray, gray)
-                        img.setPixelColor(px, fy, color)
+                # Map values to RGB using colormap lookup (fully vectorized)
+                if is_enabled:
+                    rgb = SPECTROGRAM_CMAP_ARRAY[resampled]  # (n_f, draw_w, 3)
+                else:
+                    gray = (resampled // 3).astype(np.uint8)
+                    rgb = np.stack([gray, gray, gray], axis=2)  # (n_f, draw_w, 3)
+
+                # Build BGRA buffer for QImage (Format_ARGB32 = BGRA in memory on little-endian)
+                img_array = np.zeros((n_f, draw_w, 4), dtype=np.uint8)
+                img_array[:, :, 0] = rgb[:, :, 2]  # B
+                img_array[:, :, 1] = rgb[:, :, 1]  # G
+                img_array[:, :, 2] = rgb[:, :, 0]  # R
+                img_array[:, :, 3] = 255            # A
+
+                # Ensure contiguous memory for QImage
+                img_array = np.ascontiguousarray(img_array)
+
+                # Create QImage from buffer
+                img = QImage(img_array.data, draw_w, n_f,
+                             draw_w * 4, QImage.Format.Format_ARGB32)
+                img._numpy_data = img_array  # Keep reference
 
                 # Scale to channel height
                 scaled = img.scaled(draw_w, ch_height,

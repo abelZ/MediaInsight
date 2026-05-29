@@ -2,7 +2,7 @@
 
 A cross-platform, high-performance media analysis tool built with Python and PySide6 (Qt6).
 
-Parses media files at the **raw byte level** (no FFmpeg dependency for parsing) and displays packet/box/element structure with detailed field-level decoding.
+Parses media containers at the **raw byte level** and displays packet/box/element structure with detailed field-level decoding. Audio waveform and spectrogram analysis via FFmpeg decoding.
 
 ![MediaInsight](resources/icons/app_icon_128.png)
 
@@ -16,6 +16,7 @@ Parses media files at the **raw byte level** (no FFmpeg dependency for parsing) 
 | **MPEG-TS** | Table (packet/PES view) | PAT/PMT parsing, PES reassembly, frame type detection (I/P/B), H.264/H.265 Annex B NALU parsing |
 | **MP4/MOV** | Tree (box hierarchy) | Full box parsing (60+ box types), mdat chunk/sample listing, avcC/hvcC/esds codec config decoding |
 | **WebM/MKV** | Tree (element hierarchy) | Full EBML element parsing, Cluster/Block decoding, VP8/VP9/AV1/H.264/H.265/Opus/Vorbis/AAC support |
+| **WAV** | Tree (chunk hierarchy) | RIFF chunk parsing, fmt/data/LIST/bext/fact/cue chunks, format details, byte-level hex highlighting |
 | **RTMP/RTMPS** | Dual tab (RTMP packets + FLV tags) | Pure Python protocol implementation, handshake capture, live stream analysis, Save As FLV |
 | **HLS/M3U8** | Segment list + analysis | M3U8 parsing, segment download, per-segment TS/fMP4 analysis, raw M3U8 text view |
 | **HTTP/HTTPS** | Auto-detect (FLV/TS/MP4) | Progressive download with progress display |
@@ -27,6 +28,7 @@ Parses media files at the **raw byte level** (no FFmpeg dependency for parsing) 
 | **Analyzer** | Main analysis view — table/tree + detail panel + hex view |
 | **Bitrate** | Per-second video/audio bitrate chart with IDR markers |
 | **Timestamp** | Frame number vs. timestamp progression (detect jumps/drift) |
+| **Audio** | PCM waveform display + spectrogram (log/linear scale), multi-channel, playback with cursor sync |
 | **Player** | Built-in VLC-based media player + MediaInfo metadata |
 | **Log** | Real-time application log with level filtering and auto-scroll |
 
@@ -36,6 +38,7 @@ Parses media files at the **raw byte level** (no FFmpeg dependency for parsing) 
 - **Detail Panel**: Tree-based field display with collapsible groups and value interpretation
 - **Bitrate Chart**: Per-second video/audio bitrate with IDR markers, zoomable X-axis
 - **Timestamp Chart**: Frame-by-frame timestamp progression, audio/video toggle
+- **Audio Page**: Multi-channel PCM waveform (peak envelope) + spectrogram (log/linear freq scale), Adobe Audition-style colormap, sounddevice playback with cursor sync, channel mute/toggle, zoom & seek
 - **Player Page**: Built-in VLC player (RTMP/HLS/HTTP/local) + MediaInfo metadata
 - **Log Page**: Color-coded real-time log, level filter, clear, auto-scroll
 - **Theme System**: 8 built-in color themes (Catppuccin, One Dark Pro, Dracula, Tokyo Night, Monokai Pro, GitHub Dark, Nord, Solarized Dark)
@@ -44,7 +47,7 @@ Parses media files at the **raw byte level** (no FFmpeg dependency for parsing) 
 
 ### RTMP Live Stream Analysis
 
-- Pure Python socket implementation (no librtmp/FFmpeg dependency)
+- Pure Python socket implementation (no librtmp dependency)
 - Captures full handshake (C0/C1/S0/S1/S2/C2)
 - Real-time RTMP protocol packet view (commands, control messages, media)
 - Auto-extracted FLV tags with full codec/NALU parsing
@@ -109,8 +112,11 @@ Parses media files at the **raw byte level** (no FFmpeg dependency for parsing) 
 
 - Python 3.10+
 - PySide6
+- numpy (audio waveform/spectrogram computation)
+- sounddevice (audio playback; optional — waveform display still works without it)
 - pymediainfo (for Player page MediaInfo display)
 - python-vlc (for Player page video playback; optional — requires VLC installed or bundled)
+- FFmpeg (for Audio page decoding; must be on PATH or bundled)
 
 ### From Source
 
@@ -124,8 +130,18 @@ python run.py
 ### Dependencies
 
 ```bash
-pip install PySide6 pymediainfo python-vlc
+pip install PySide6 pymediainfo python-vlc numpy sounddevice
 ```
+
+#### FFmpeg
+
+The Audio page uses FFmpeg to decode audio from any container format to PCM:
+
+- **Windows**: Download from https://ffmpeg.org/download.html — add `ffmpeg.exe` directory to PATH
+- **macOS**: `brew install ffmpeg`
+- **Linux**: `sudo apt install ffmpeg` or `sudo yum install ffmpeg`
+
+If FFmpeg is not available, all analysis features still work — only the Audio tab's waveform/spectrogram/playback is disabled.
 
 #### VLC Player
 
@@ -171,7 +187,7 @@ Output: `dist/MediaInsight.app`
 
 ### Open a File
 
-- **File → Open File** (Ctrl+O): Open a local media file (FLV, TS, MP4, MOV, WebM, MKV)
+- **File → Open File** (Ctrl+O): Open a local media file (FLV, TS, MP4, MOV, WebM, MKV, WAV)
 - **File → Open URL** (Ctrl+U): Open HTTP/HTTPS/RTMP/RTMPS/HLS(M3U8) stream
 
 ### Navigation
@@ -181,6 +197,7 @@ Output: `dist/MediaInsight.app`
 | Analyzer | — | Main analysis view (table/tree + detail + hex) |
 | Bitrate | — | Per-second bitrate chart with IDR markers |
 | Timestamp | — | Frame sequence vs timestamp chart |
+| Audio | — | PCM waveform + spectrogram, multi-channel playback |
 | Player | — | Video playback + MediaInfo display |
 | Log | — | Real-time application log |
 
@@ -231,6 +248,7 @@ src/media_analyzer/
 │   ├── ts/              # MPEG-TS parser (PES reassembly, frame detection)
 │   ├── mp4/             # MP4/MOV parser (box hierarchy, sample tables)
 │   ├── ebml/            # WebM/MKV parser (EBML elements, Cluster/Block decoding)
+│   ├── wav/             # WAV parser (RIFF chunks, fmt/data/LIST parsing)
 │   ├── h264/            # H.264 bitstream (SPS/PPS, BitReader, exp-Golomb)
 │   └── h265/            # H.265 bitstream (VPS/SPS/PPS)
 ├── ui/
@@ -242,15 +260,17 @@ src/media_analyzer/
 │   ├── hls_view.py      # HLS segment list + raw M3U8 text view
 │   ├── bitrate_page.py  # Bitrate analysis chart (QtCharts)
 │   ├── timestamp_page.py # Timestamp progression chart (QtCharts)
+│   ├── audio_page.py    # Audio waveform + spectrogram (FFmpeg decode, sounddevice playback)
 │   ├── log_page.py      # Real-time log view with filtering
 │   ├── detail_panel.py  # Field tree display (all formats)
 │   ├── hex_view.py      # Hex + ASCII split view
 │   ├── player_page.py   # VLC Player + MediaInfo page
 │   └── themes.py        # Color theme definitions
 └── workers/
-    ├── parse_worker.py  # Background parsing thread (FLV/TS/MP4/WebM)
+    ├── parse_worker.py  # Background parsing thread (FLV/TS/MP4/WebM/WAV)
     ├── rtmp_worker.py   # RTMP session worker thread
-    └── hls_worker.py    # HLS segment download + parse worker
+    ├── hls_worker.py    # HLS segment download + parse worker
+    └── audio_decode_worker.py  # FFmpeg audio decode to PCM (background thread)
 ```
 
 ## Developer

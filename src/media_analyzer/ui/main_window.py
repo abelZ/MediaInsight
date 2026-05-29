@@ -262,7 +262,8 @@ class MainWindow(QMainWindow):
             "About MediaInsight",
             "<h3>MediaInsight</h3>"
             "<p>A cross-platform media analysis tool.</p>"
-            "<p>Parses media files at raw byte level without FFmpeg dependency.</p>"
+            "<p>Parses media containers at raw byte level. "
+            "Audio waveform/spectrogram analysis via FFmpeg decoding.</p>"
             "<hr>"
             "<p><b>Supported Formats:</b></p>"
             "<ul>"
@@ -270,17 +271,20 @@ class MainWindow(QMainWindow):
             "<li>MPEG-TS (Transport Stream)</li>"
             "<li>MP4/MOV (ISO BMFF)</li>"
             "<li>WebM/MKV (Matroska / EBML)</li>"
+            "<li>WAV (RIFF/WAVE)</li>"
             "<li>RTMP / RTMPS (Live Stream)</li>"
             "<li>HLS / M3U8 (HTTP Live Streaming)</li>"
             "<li>HTTP/HTTPS progressive download</li>"
             "</ul>"
             "<p><b>Analysis:</b> Packet/Box/Element hierarchy, NALU parsing, "
-            "Bitrate chart, Timestamp chart, Video playback, MediaInfo</p>"
+            "Bitrate chart, Timestamp chart, Audio waveform &amp; spectrogram, "
+            "Video playback, MediaInfo</p>"
             "<p><b>Log:</b> Real-time application log with level filtering</p>"
             "<hr>"
+            "<p><b>Dependencies:</b> FFmpeg (audio decoding), VLC (video playback, optional)</p>"
             "<p><b>Developer:</b> Abel</p>"
             "<p><b>Email:</b> fylaotou@gmail.com</p>"
-            "<p><b>Version:</b> 0.4.0</p>"
+            "<p><b>Version:</b> 0.5.0</p>"
         )
 
     def _setup_statusbar(self):

@@ -160,7 +160,7 @@ class _TrackInfo:
     """Metadata for a single track."""
     __slots__ = ('number', 'track_type', 'codec_id', 'codec_label',
                  'width', 'height', 'sample_rate', 'channels',
-                 'default_duration_ns')
+                 'default_duration_ns', 'codec_private')
 
     def __init__(self):
         self.number: int = 0
@@ -172,6 +172,7 @@ class _TrackInfo:
         self.sample_rate: float = 0
         self.channels: int = 0
         self.default_duration_ns: int = 0
+        self.codec_private: bytes = b""
 
 
 class EBMLParser(BaseParser):
@@ -191,6 +192,7 @@ class EBMLParser(BaseParser):
         self._video_count: int = 0
         self._audio_count: int = 0
         self._max_timestamp_ms: int = 0
+        self._last_track_codec_id: str = ""  # Codec ID of last parsed TrackEntry
 
     @classmethod
     def sniff(cls, header_bytes: bytes) -> bool:
@@ -278,6 +280,14 @@ class EBMLParser(BaseParser):
                     "detail": detail,
                 },
             )
+
+            # For CodecPrivate, attach parsed codec config (avcC/hvcC)
+            if elem_id == CODEC_PRIVATE and elem_size > 0:
+                codec_config = self._parse_codec_private(
+                    data, elem_data_start, elem_size, self._last_track_codec_id)
+                if codec_config:
+                    pkt.script_data["codec_config"] = codec_config
+                    pkt.script_data["codec_id"] = self._last_track_codec_id
 
             # For blocks, add timestamp
             if elem_id in (SIMPLE_BLOCK, BLOCK):
@@ -478,6 +488,8 @@ class EBMLParser(BaseParser):
                 track.codec_label = CODEC_MAP.get(track.codec_id, track.codec_id)
             elif eid == DEFAULT_DURATION_ID and esz <= 8:
                 track.default_duration_ns = int.from_bytes(data[dstart:dstart+esz], "big")
+            elif eid == CODEC_PRIVATE:
+                track.codec_private = data[dstart:dstart+esz]
             elif eid == VIDEO:
                 self._parse_video_settings(data, dstart, esz, track)
             elif eid == AUDIO_ELEMENT:
@@ -485,6 +497,7 @@ class EBMLParser(BaseParser):
             pos = dstart + esz
         if track.number > 0:
             self._tracks[track.number] = track
+            self._last_track_codec_id = track.codec_id
 
     def _parse_video_settings(self, data: bytes, start: int, size: int, track: _TrackInfo):
         pos = start
@@ -518,6 +531,448 @@ class EBMLParser(BaseParser):
             elif eid == CHANNELS and esz <= 4:
                 track.channels = int.from_bytes(data[dstart:dstart+esz], "big")
             pos = dstart + esz
+
+    def _parse_codec_private(self, data: bytes, start: int, size: int,
+                             codec_id: str) -> Optional[Dict[str, Any]]:
+        """Parse CodecPrivate data based on codec type.
+
+        For H.264: parses avcC (AVCDecoderConfigurationRecord) with SPS/PPS.
+        For H.265: parses hvcC (HEVCDecoderConfigurationRecord) with VPS/SPS/PPS.
+        For AAC: parses AudioSpecificConfig.
+        For Opus: parses OpusHead.
+        For Vorbis: parses identification header.
+        For FLAC: parses STREAMINFO metadata block.
+        """
+        if size < 2:
+            return None
+
+        cp_data = data[start:start + size]
+
+        if codec_id == "V_MPEG4/ISO/AVC" and size >= 7:
+            return self._parse_avcc(cp_data)
+        elif codec_id == "V_MPEGH/ISO/HEVC" and size >= 23:
+            return self._parse_hvcc(cp_data)
+        elif codec_id.startswith("A_AAC"):
+            return self._parse_aac_codec_private(cp_data)
+        elif codec_id == "A_OPUS" and size >= 11:
+            return self._parse_opus_codec_private(cp_data)
+        elif codec_id == "A_VORBIS" and size >= 30:
+            return self._parse_vorbis_codec_private(cp_data)
+        elif codec_id == "A_FLAC" and size >= 4:
+            return self._parse_flac_codec_private(cp_data)
+        return None
+
+    def _parse_avcc(self, data: bytes) -> Optional[Dict[str, Any]]:
+        """Parse AVCDecoderConfigurationRecord (avcC) from CodecPrivate."""
+        if len(data) < 7:
+            return None
+        result: Dict[str, Any] = {
+            "type": "avcC",
+            "configuration_version": data[0],
+            "profile_idc": data[1],
+            "profile_compatibility": f"0x{data[2]:02X}",
+            "level_idc": data[3],
+            "nalu_length_size": (data[4] & 0x03) + 1,
+        }
+
+        profile_names = {
+            66: "Baseline", 77: "Main", 88: "Extended",
+            100: "High", 110: "High 10", 122: "High 4:2:2",
+            244: "High 4:4:4 Predictive",
+        }
+        result["profile_name"] = profile_names.get(data[1], f"Unknown({data[1]})")
+        result["level"] = f"{data[3] / 10:.1f}"
+
+        # Parse SPS
+        num_sps = data[5] & 0x1F
+        result["num_sps"] = num_sps
+        pos = 6
+        sps_list = []
+        for _ in range(num_sps):
+            if pos + 2 > len(data):
+                break
+            sps_len = struct.unpack(">H", data[pos:pos+2])[0]
+            pos += 2
+            if pos + sps_len > len(data):
+                break
+            sps_data = data[pos:pos+sps_len]
+            pos += sps_len
+            sps_fields = self._parse_h264_sps(sps_data)
+            sps_list.append(sps_fields)
+        if sps_list:
+            result["sps"] = sps_list
+
+        # Parse PPS
+        if pos < len(data):
+            num_pps = data[pos]
+            result["num_pps"] = num_pps
+            pos += 1
+            pps_list = []
+            for _ in range(num_pps):
+                if pos + 2 > len(data):
+                    break
+                pps_len = struct.unpack(">H", data[pos:pos+2])[0]
+                pos += 2
+                if pos + pps_len > len(data):
+                    break
+                pps_data = data[pos:pos+pps_len]
+                pos += pps_len
+                pps_fields = self._parse_h264_pps(pps_data)
+                pps_list.append(pps_fields)
+            if pps_list:
+                result["pps"] = pps_list
+
+        return result
+
+    def _parse_hvcc(self, data: bytes) -> Optional[Dict[str, Any]]:
+        """Parse HEVCDecoderConfigurationRecord (hvcC) from CodecPrivate."""
+        if len(data) < 23:
+            return None
+        result: Dict[str, Any] = {
+            "type": "hvcC",
+            "configuration_version": data[0],
+        }
+        byte1 = data[1]
+        result["general_profile_space"] = (byte1 >> 6) & 0x03
+        result["general_tier_flag"] = (byte1 >> 5) & 0x01
+        result["general_profile_idc"] = byte1 & 0x1F
+        result["general_profile_compatibility_flags"] = struct.unpack(">I", data[2:6])[0]
+        result["general_level_idc"] = data[12]
+        result["level"] = f"{data[12] / 30:.1f}"
+
+        chroma_format = (data[13] >> 6) & 0x03 if len(data) > 13 else 0
+        bit_depth_luma = ((data[14] >> 5) & 0x07) + 8 if len(data) > 14 else 8
+        bit_depth_chroma = ((data[14] >> 2) & 0x07) + 8 if len(data) > 14 else 8
+        result["chroma_format_idc"] = chroma_format
+        result["bit_depth_luma"] = bit_depth_luma
+        result["bit_depth_chroma"] = bit_depth_chroma
+
+        # Number of arrays
+        if len(data) > 22:
+            nalu_length_size = (data[21] & 0x03) + 1
+            num_arrays = data[22]
+            result["nalu_length_size"] = nalu_length_size
+            result["num_arrays"] = num_arrays
+
+            # Parse arrays (VPS/SPS/PPS)
+            pos = 23
+            for _ in range(num_arrays):
+                if pos + 3 > len(data):
+                    break
+                nalu_type = data[pos] & 0x3F
+                num_nalus = struct.unpack(">H", data[pos+1:pos+3])[0]
+                pos += 3
+
+                for _ in range(num_nalus):
+                    if pos + 2 > len(data):
+                        break
+                    nalu_len = struct.unpack(">H", data[pos:pos+2])[0]
+                    pos += 2
+                    if pos + nalu_len > len(data):
+                        break
+                    nalu_data = data[pos:pos+nalu_len]
+                    pos += nalu_len
+
+                    if nalu_type == 33:  # SPS
+                        sps_fields = self._parse_hevc_sps(nalu_data)
+                        if sps_fields:
+                            result["sps"] = sps_fields
+                    elif nalu_type == 34:  # PPS
+                        pps_fields = self._parse_hevc_pps(nalu_data)
+                        if pps_fields:
+                            result["pps"] = pps_fields
+                    elif nalu_type == 32:  # VPS
+                        result["vps"] = {"raw": nalu_data[:32].hex()}
+
+        return result
+
+    @staticmethod
+    def _parse_h264_sps(sps_data: bytes) -> Dict[str, Any]:
+        """Parse H.264 SPS NALU data."""
+        try:
+            from media_analyzer.parsers.h264.sps import parse_sps
+            fields = parse_sps(sps_data)
+            if fields:
+                result = {}
+                for entry in fields:
+                    if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                        result[str(entry[0])] = entry[1]
+                return result
+        except Exception:
+            pass
+        return {"raw": sps_data[:16].hex()}
+
+    @staticmethod
+    def _parse_h264_pps(pps_data: bytes) -> Dict[str, Any]:
+        """Parse H.264 PPS NALU data."""
+        try:
+            from media_analyzer.parsers.h264.pps import parse_pps
+            fields = parse_pps(pps_data)
+            if fields:
+                result = {}
+                for entry in fields:
+                    if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                        result[str(entry[0])] = entry[1]
+                return result
+        except Exception:
+            pass
+        return {"raw": pps_data[:16].hex()}
+
+    @staticmethod
+    def _parse_hevc_sps(sps_data: bytes) -> Dict[str, Any]:
+        """Parse H.265 SPS NALU data."""
+        try:
+            from media_analyzer.parsers.h265.sps import parse_hevc_sps
+            fields = parse_hevc_sps(sps_data)
+            if fields:
+                result = {}
+                for entry in fields:
+                    if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                        result[str(entry[0])] = entry[1]
+                return result
+        except Exception:
+            pass
+        return {"raw": sps_data[:16].hex()}
+
+    @staticmethod
+    def _parse_hevc_pps(pps_data: bytes) -> Dict[str, Any]:
+        """Parse H.265 PPS NALU data."""
+        try:
+            from media_analyzer.parsers.h265.pps import parse_hevc_pps
+            fields = parse_hevc_pps(pps_data)
+            if fields:
+                result = {}
+                for entry in fields:
+                    if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                        result[str(entry[0])] = entry[1]
+                return result
+        except Exception:
+            pass
+        return {"raw": pps_data[:16].hex()}
+
+    @staticmethod
+    def _parse_aac_codec_private(data: bytes) -> Optional[Dict[str, Any]]:
+        """Parse AAC AudioSpecificConfig from CodecPrivate.
+        MKV stores raw AudioSpecificConfig (2-5 bytes) directly."""
+        if len(data) < 2:
+            return None
+        result: Dict[str, Any] = {"type": "AudioSpecificConfig"}
+
+        byte0 = data[0]
+        byte1 = data[1]
+        audio_object_type = (byte0 >> 3) & 0x1F
+        freq_index = ((byte0 & 0x07) << 1) | ((byte1 >> 7) & 0x01)
+        channel_config = (byte1 >> 3) & 0x0F
+
+        # Extended AOT (if AOT == 31)
+        if audio_object_type == 31 and len(data) >= 3:
+            audio_object_type = 32 + ((byte0 & 0x07) << 3) | ((byte1 >> 5) & 0x07)
+            freq_index = ((byte1 & 0x1E) >> 1)
+            channel_config = ((byte1 & 0x01) << 3) | ((data[2] >> 5) & 0x07)
+
+        freq_table = [96000, 88200, 64000, 48000, 44100, 32000,
+                      24000, 22050, 16000, 12000, 11025, 8000, 7350]
+        sample_rate = freq_table[freq_index] if freq_index < len(freq_table) else 0
+
+        # If freq_index == 0xF, explicit 24-bit sample rate follows
+        if freq_index == 0x0F and len(data) >= 5:
+            sample_rate = (data[1] & 0x7F) << 17 | data[2] << 9 | data[3] << 1 | (data[4] >> 7)
+
+        aot_names = {
+            1: "AAC Main", 2: "AAC-LC", 3: "AAC SSR",
+            4: "AAC LTP", 5: "SBR (HE-AAC)", 6: "AAC Scalable",
+            23: "ER AAC LD", 29: "PS (HE-AAC v2)", 39: "ER AAC ELD",
+        }
+        channel_names = {
+            1: "Mono (1ch)", 2: "Stereo (2ch)", 3: "3.0 (3ch)",
+            4: "4.0 (4ch)", 5: "5.0 (5ch)", 6: "5.1 (6ch)", 7: "7.1 (8ch)",
+        }
+
+        result["audio_object_type"] = audio_object_type
+        result["audio_object_type_name"] = aot_names.get(audio_object_type, f"AOT {audio_object_type}")
+        result["sampling_frequency_index"] = freq_index
+        result["sampling_frequency"] = f"{sample_rate} Hz"
+        result["channel_configuration"] = channel_config
+        result["channel_layout"] = channel_names.get(channel_config, f"{channel_config}ch")
+
+        # Check for SBR/PS extension
+        if audio_object_type in (5, 29) or (len(data) >= 4 and audio_object_type == 2):
+            result["note"] = "May contain SBR/PS extension (HE-AAC)"
+
+        return result
+
+    @staticmethod
+    def _parse_opus_codec_private(data: bytes) -> Optional[Dict[str, Any]]:
+        """Parse OpusHead structure from CodecPrivate.
+        Format: 'OpusHead' magic (8 bytes) + version(1) + channels(1) +
+                pre_skip(2) + input_sample_rate(4) + output_gain(2) + mapping_family(1)"""
+        if len(data) < 11:
+            return None
+        result: Dict[str, Any] = {"type": "OpusHead"}
+
+        # Check for 'OpusHead' magic
+        offset = 0
+        if data[:8] == b'OpusHead':
+            offset = 8
+        elif len(data) >= 19 and data[:8] != b'OpusHead':
+            # Some muxers skip the magic and start at version
+            offset = 0
+
+        if offset + 11 > len(data):
+            # Minimal: version(1) + channels(1) + preskip(2) + rate(4) + gain(2) + family(1)
+            if len(data) >= 11:
+                offset = 0
+            else:
+                return None
+
+        result["version"] = data[offset]
+        result["output_channel_count"] = data[offset + 1]
+        result["pre_skip"] = int.from_bytes(data[offset + 2:offset + 4], "little")
+        result["input_sample_rate"] = int.from_bytes(data[offset + 4:offset + 8], "little")
+        result["output_gain"] = int.from_bytes(data[offset + 8:offset + 10], "little", signed=True)
+        result["channel_mapping_family"] = data[offset + 10]
+
+        channels = result["output_channel_count"]
+        channel_desc = {1: "Mono", 2: "Stereo", 3: "Linear Surround",
+                        4: "Quadraphonic", 5: "5.0 Surround",
+                        6: "5.1 Surround", 7: "6.1 Surround", 8: "7.1 Surround"}
+        result["channel_layout"] = channel_desc.get(channels, f"{channels}ch")
+
+        # Gain in dB (Q7.8 fixed-point)
+        gain_db = result["output_gain"] / 256.0
+        result["output_gain_db"] = f"{gain_db:.2f} dB"
+
+        return result
+
+    @staticmethod
+    def _parse_vorbis_codec_private(data: bytes) -> Optional[Dict[str, Any]]:
+        """Parse Vorbis CodecPrivate (laced identification + comment + setup headers).
+        First byte is number_of_headers (always 2 for 3 headers).
+        Then sizes in Xiph lacing, then the raw header data."""
+        if len(data) < 30:
+            return None
+        result: Dict[str, Any] = {"type": "VorbisConfig"}
+
+        # First byte: number of packets minus 1 (should be 2)
+        num_headers_minus1 = data[0]
+        if num_headers_minus1 != 2:
+            result["raw"] = data[:16].hex()
+            return result
+
+        # Read Xiph lacing sizes for first 2 headers
+        pos = 1
+        sizes = []
+        for _ in range(2):
+            size = 0
+            while pos < len(data):
+                b = data[pos]
+                pos += 1
+                size += b
+                if b < 255:
+                    break
+            sizes.append(size)
+
+        if len(sizes) < 2 or pos + sizes[0] + sizes[1] > len(data):
+            result["raw"] = data[:16].hex()
+            return result
+
+        # Parse identification header (first header)
+        id_header = data[pos:pos + sizes[0]]
+        if len(id_header) >= 23 and id_header[0] == 0x01 and id_header[1:7] == b'vorbis':
+            result["vorbis_version"] = int.from_bytes(id_header[7:11], "little")
+            result["audio_channels"] = id_header[11]
+            result["audio_sample_rate"] = int.from_bytes(id_header[12:16], "little")
+            result["bitrate_maximum"] = int.from_bytes(id_header[16:20], "little", signed=True)
+            result["bitrate_nominal"] = int.from_bytes(id_header[20:24], "little", signed=True)
+            result["bitrate_minimum"] = int.from_bytes(id_header[24:28], "little", signed=True)
+            blocksize_byte = id_header[28]
+            result["blocksize_0"] = 1 << (blocksize_byte & 0x0F)
+            result["blocksize_1"] = 1 << ((blocksize_byte >> 4) & 0x0F)
+
+            channels = result["audio_channels"]
+            channel_desc = {1: "Mono", 2: "Stereo", 3: "3.0", 4: "Quadraphonic",
+                            5: "5.0 Surround", 6: "5.1 Surround", 8: "7.1 Surround"}
+            result["channel_layout"] = channel_desc.get(channels, f"{channels}ch")
+
+            # Format bitrates nicely
+            nom = result["bitrate_nominal"]
+            if nom > 0:
+                result["bitrate_nominal_kbps"] = f"{nom / 1000:.0f} kbps"
+        else:
+            result["raw"] = id_header[:16].hex()
+
+        return result
+
+    @staticmethod
+    def _parse_flac_codec_private(data: bytes) -> Optional[Dict[str, Any]]:
+        """Parse FLAC CodecPrivate (fLaC marker + STREAMINFO metadata block).
+        MKV format: the CodecPrivate starts with a METADATA_BLOCK_HEADER(4 bytes)
+        followed by STREAMINFO (34 bytes), optionally preceded by 'fLaC' marker."""
+        if len(data) < 4:
+            return None
+        result: Dict[str, Any] = {"type": "FLAC_STREAMINFO"}
+
+        offset = 0
+        # Check for 'fLaC' marker
+        if data[:4] == b'fLaC':
+            offset = 4
+
+        # METADATA_BLOCK_HEADER: 1 byte (last-flag + type) + 3 bytes (size)
+        if offset + 4 > len(data):
+            return None
+
+        block_type = data[offset] & 0x7F
+        block_size = int.from_bytes(data[offset + 1:offset + 4], "big")
+        offset += 4
+
+        if block_type != 0:  # Type 0 = STREAMINFO
+            # Try without header (some muxers put raw STREAMINFO)
+            if len(data) >= 34:
+                offset = 0
+                block_size = 34
+            else:
+                result["raw"] = data[:16].hex()
+                return result
+
+        # STREAMINFO: 34 bytes
+        if offset + 34 > len(data):
+            result["raw"] = data[:min(16, len(data))].hex()
+            return result
+
+        si = data[offset:offset + 34]
+        result["min_block_size"] = int.from_bytes(si[0:2], "big")
+        result["max_block_size"] = int.from_bytes(si[2:4], "big")
+        result["min_frame_size"] = int.from_bytes(si[4:7], "big")
+        result["max_frame_size"] = int.from_bytes(si[7:10], "big")
+
+        # Bits 80-99: sample rate(20) + channels-1(3) + bits_per_sample-1(5) + total_samples(36)
+        packed = int.from_bytes(si[10:18], "big")
+        total_samples = packed & 0xFFFFFFFFF  # Lower 36 bits
+        bits_per_sample = ((packed >> 36) & 0x1F) + 1
+        channels = ((packed >> 41) & 0x07) + 1
+        sample_rate = (packed >> 44) & 0xFFFFF
+
+        result["sample_rate"] = f"{sample_rate} Hz"
+        result["channels"] = channels
+        result["bits_per_sample"] = bits_per_sample
+        result["total_samples"] = total_samples
+
+        if sample_rate > 0 and total_samples > 0:
+            duration_s = total_samples / sample_rate
+            mins = int(duration_s // 60)
+            secs = duration_s % 60
+            result["duration"] = f"{mins:02d}:{secs:06.3f} ({duration_s:.3f}s)"
+
+        channel_desc = {1: "Mono", 2: "Stereo", 3: "3.0",
+                        4: "Quadraphonic", 5: "5.0", 6: "5.1", 8: "7.1"}
+        result["channel_layout"] = channel_desc.get(channels, f"{channels}ch")
+
+        # MD5 signature (16 bytes at offset 18)
+        md5 = si[18:34].hex()
+        if md5 != "0" * 32:
+            result["md5_signature"] = md5
+
+        return result
 
     def _get_element_detail(self, data: bytes, elem_id: int, start: int, size: int) -> str:
         """Get human-readable detail for leaf elements."""
@@ -598,6 +1053,39 @@ class EBMLParser(BaseParser):
 
         # Binary data (show size only for large, hex for small)
         elif elem_id in (CODEC_PRIVATE, 0x465C, 0x63A2):  # CodecPrivate, FileData
+            if elem_id == CODEC_PRIVATE:
+                # Try to provide meaningful summary based on codec
+                codec_id = self._last_track_codec_id
+                if codec_id == "V_MPEG4/ISO/AVC" and size >= 7:
+                    # avcC format
+                    profile = data[start + 1] if size > 1 else 0
+                    level = data[start + 3] if size > 3 else 0
+                    profile_names = {
+                        66: "Baseline", 77: "Main", 88: "Extended",
+                        100: "High", 110: "High 10", 122: "High 4:2:2",
+                        244: "High 4:4:4 Predictive",
+                    }
+                    pname = profile_names.get(profile, f"Unknown({profile})")
+                    return f"avcC: {pname} Profile, Level {level/10:.1f} ({size} bytes)"
+                elif codec_id == "V_MPEGH/ISO/HEVC" and size >= 23:
+                    # hvcC format check
+                    if data[start] == 1:  # configurationVersion == 1
+                        profile_idc = data[start + 1] & 0x1F
+                        level_idc = data[start + 12] if size > 12 else 0
+                        return f"hvcC: Profile {profile_idc}, Level {level_idc/30:.1f} ({size} bytes)"
+                elif codec_id.startswith("A_AAC") and size >= 2:
+                    byte0 = data[start]
+                    byte1 = data[start + 1]
+                    aot = (byte0 >> 3) & 0x1F
+                    aot_names = {1: "Main", 2: "LC", 3: "SSR", 4: "LTP", 5: "SBR", 29: "PS"}
+                    return f"AAC {aot_names.get(aot, f'AOT{aot}')} ({size} bytes)"
+                elif codec_id == "A_OPUS":
+                    return f"OpusHead ({size} bytes)"
+                elif codec_id == "A_VORBIS":
+                    return f"Vorbis Headers ({size} bytes)"
+                elif codec_id == "A_FLAC":
+                    return f"FLAC STREAMINFO ({size} bytes)"
+                return f"{size} bytes"
             if size <= 16:
                 return data[start:start+size].hex()
             return f"{size} bytes"

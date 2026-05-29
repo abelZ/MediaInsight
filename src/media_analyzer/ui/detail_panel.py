@@ -1027,6 +1027,11 @@ class DetailPanelWidget(QWidget):
             # Add type-specific interpretation
             self._add_ebml_value_details(val_item, elem_id, detail, packet)
 
+        # --- CodecPrivate parsed config (avcC/hvcC with SPS/PPS) ---
+        codec_config = d.get("codec_config")
+        if codec_config:
+            self._show_codec_config_details(codec_config, d.get("codec_id", ""))
+
         # --- Block details (for SimpleBlock/Block) ---
         if d.get("ebml_track"):
             track_num = d.get("track_num")
@@ -1120,6 +1125,174 @@ class DetailPanelWidget(QWidget):
                 self._add_field(parent, "Family", "Audio codec")
             elif detail.startswith("S_"):
                 self._add_field(parent, "Family", "Subtitle codec")
+
+    def _show_codec_config_details(self, config: dict, codec_id: str) -> None:
+        """Display parsed CodecPrivate (avcC/hvcC/AAC/Opus/Vorbis/FLAC) in detail tree."""
+        config_type = config.get("type", "")
+
+        if config_type == "avcC":
+            # --- avcC Header ---
+            hdr_item = QTreeWidgetItem(self._tree, ["AVC Configuration (avcC)", ""])
+            hdr_item.setExpanded(True)
+            self._add_field(hdr_item, "Configuration Version",
+                            str(config.get("configuration_version", "")))
+            self._add_field(hdr_item, "Profile",
+                            f"{config.get('profile_name', '')} ({config.get('profile_idc', '')})")
+            self._add_field(hdr_item, "Profile Compatibility",
+                            str(config.get("profile_compatibility", "")))
+            self._add_field(hdr_item, "Level", config.get("level", ""))
+            self._add_field(hdr_item, "NALU Length Size",
+                            f"{config.get('nalu_length_size', '')} bytes")
+
+            # --- SPS ---
+            sps_list = config.get("sps", [])
+            if sps_list:
+                for i, sps in enumerate(sps_list):
+                    sps_item = QTreeWidgetItem(self._tree,
+                                              [f"SPS #{i}" if len(sps_list) > 1 else "SPS", ""])
+                    sps_item.setExpanded(True)
+                    for key, val in sps.items():
+                        self._add_field(sps_item, key, self._format_value(val))
+
+            # --- PPS ---
+            pps_list = config.get("pps", [])
+            if pps_list:
+                for i, pps in enumerate(pps_list):
+                    pps_item = QTreeWidgetItem(self._tree,
+                                              [f"PPS #{i}" if len(pps_list) > 1 else "PPS", ""])
+                    pps_item.setExpanded(True)
+                    for key, val in pps.items():
+                        self._add_field(pps_item, key, self._format_value(val))
+
+        elif config_type == "hvcC":
+            # --- hvcC Header ---
+            hdr_item = QTreeWidgetItem(self._tree, ["HEVC Configuration (hvcC)", ""])
+            hdr_item.setExpanded(True)
+            self._add_field(hdr_item, "Configuration Version",
+                            str(config.get("configuration_version", "")))
+            self._add_field(hdr_item, "General Profile IDC",
+                            str(config.get("general_profile_idc", "")))
+            self._add_field(hdr_item, "General Tier Flag",
+                            str(config.get("general_tier_flag", "")))
+            self._add_field(hdr_item, "General Level IDC",
+                            f"{config.get('general_level_idc', '')} (Level {config.get('level', '')})")
+            self._add_field(hdr_item, "Chroma Format IDC",
+                            str(config.get("chroma_format_idc", "")))
+            self._add_field(hdr_item, "Bit Depth Luma",
+                            str(config.get("bit_depth_luma", "")))
+            self._add_field(hdr_item, "Bit Depth Chroma",
+                            str(config.get("bit_depth_chroma", "")))
+            self._add_field(hdr_item, "NALU Length Size",
+                            f"{config.get('nalu_length_size', '')} bytes")
+
+            # --- SPS ---
+            sps = config.get("sps")
+            if sps:
+                sps_item = QTreeWidgetItem(self._tree, ["SPS", ""])
+                sps_item.setExpanded(True)
+                for key, val in sps.items():
+                    self._add_field(sps_item, key, self._format_value(val))
+
+            # --- PPS ---
+            pps = config.get("pps")
+            if pps:
+                pps_item = QTreeWidgetItem(self._tree, ["PPS", ""])
+                pps_item.setExpanded(True)
+                for key, val in pps.items():
+                    self._add_field(pps_item, key, self._format_value(val))
+
+            # --- VPS ---
+            vps = config.get("vps")
+            if vps:
+                vps_item = QTreeWidgetItem(self._tree, ["VPS", ""])
+                vps_item.setExpanded(True)
+                for key, val in vps.items():
+                    self._add_field(vps_item, key, self._format_value(val))
+
+        elif config_type == "AudioSpecificConfig":
+            # --- AAC AudioSpecificConfig ---
+            hdr_item = QTreeWidgetItem(self._tree, ["AAC AudioSpecificConfig", ""])
+            hdr_item.setExpanded(True)
+            self._add_field(hdr_item, "Audio Object Type",
+                            f"{config.get('audio_object_type_name', '')} ({config.get('audio_object_type', '')})")
+            self._add_field(hdr_item, "Sampling Frequency",
+                            str(config.get("sampling_frequency", "")))
+            self._add_field(hdr_item, "Frequency Index",
+                            str(config.get("sampling_frequency_index", "")))
+            self._add_field(hdr_item, "Channel Configuration",
+                            f"{config.get('channel_layout', '')} ({config.get('channel_configuration', '')})")
+            if config.get("note"):
+                self._add_field(hdr_item, "Note", config["note"])
+
+        elif config_type == "OpusHead":
+            # --- Opus Head ---
+            hdr_item = QTreeWidgetItem(self._tree, ["Opus Configuration (OpusHead)", ""])
+            hdr_item.setExpanded(True)
+            self._add_field(hdr_item, "Version", str(config.get("version", "")))
+            self._add_field(hdr_item, "Output Channels",
+                            f"{config.get('output_channel_count', '')} ({config.get('channel_layout', '')})")
+            self._add_field(hdr_item, "Pre-skip",
+                            f"{config.get('pre_skip', '')} samples")
+            self._add_field(hdr_item, "Input Sample Rate",
+                            f"{config.get('input_sample_rate', '')} Hz")
+            self._add_field(hdr_item, "Output Gain",
+                            str(config.get("output_gain_db", "")))
+            self._add_field(hdr_item, "Channel Mapping Family",
+                            str(config.get("channel_mapping_family", "")))
+
+        elif config_type == "VorbisConfig":
+            # --- Vorbis Identification Header ---
+            hdr_item = QTreeWidgetItem(self._tree, ["Vorbis Configuration", ""])
+            hdr_item.setExpanded(True)
+            if "audio_channels" in config:
+                self._add_field(hdr_item, "Vorbis Version",
+                                str(config.get("vorbis_version", "")))
+                self._add_field(hdr_item, "Channels",
+                                f"{config.get('audio_channels', '')} ({config.get('channel_layout', '')})")
+                self._add_field(hdr_item, "Sample Rate",
+                                f"{config.get('audio_sample_rate', '')} Hz")
+                if config.get("bitrate_nominal_kbps"):
+                    self._add_field(hdr_item, "Nominal Bitrate",
+                                    config["bitrate_nominal_kbps"])
+                br_max = config.get("bitrate_maximum", 0)
+                br_min = config.get("bitrate_minimum", 0)
+                if br_max > 0:
+                    self._add_field(hdr_item, "Max Bitrate", f"{br_max / 1000:.0f} kbps")
+                if br_min > 0:
+                    self._add_field(hdr_item, "Min Bitrate", f"{br_min / 1000:.0f} kbps")
+                self._add_field(hdr_item, "Block Size 0",
+                                str(config.get("blocksize_0", "")))
+                self._add_field(hdr_item, "Block Size 1",
+                                str(config.get("blocksize_1", "")))
+            elif config.get("raw"):
+                self._add_field(hdr_item, "Raw", config["raw"])
+
+        elif config_type == "FLAC_STREAMINFO":
+            # --- FLAC STREAMINFO ---
+            hdr_item = QTreeWidgetItem(self._tree, ["FLAC STREAMINFO", ""])
+            hdr_item.setExpanded(True)
+            self._add_field(hdr_item, "Sample Rate",
+                            str(config.get("sample_rate", "")))
+            self._add_field(hdr_item, "Channels",
+                            f"{config.get('channels', '')} ({config.get('channel_layout', '')})")
+            self._add_field(hdr_item, "Bits Per Sample",
+                            str(config.get("bits_per_sample", "")))
+            self._add_field(hdr_item, "Total Samples",
+                            f"{config.get('total_samples', ''):,}")
+            if config.get("duration"):
+                self._add_field(hdr_item, "Duration", config["duration"])
+            self._add_field(hdr_item, "Min Block Size",
+                            str(config.get("min_block_size", "")))
+            self._add_field(hdr_item, "Max Block Size",
+                            str(config.get("max_block_size", "")))
+            min_fs = config.get("min_frame_size", 0)
+            max_fs = config.get("max_frame_size", 0)
+            if min_fs > 0:
+                self._add_field(hdr_item, "Min Frame Size", f"{min_fs} bytes")
+            if max_fs > 0:
+                self._add_field(hdr_item, "Max Frame Size", f"{max_fs} bytes")
+            if config.get("md5_signature"):
+                self._add_field(hdr_item, "MD5 Signature", config["md5_signature"])
 
     def _format_value(self, value: Any) -> str:
         if isinstance(value, float):
