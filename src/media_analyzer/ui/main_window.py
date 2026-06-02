@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         self._nav_bar.addTab("Analyzer")
         self._nav_bar.addTab("Bitrate")
         self._nav_bar.addTab("Timestamp")
+        self._nav_bar.addTab("GOP")
         self._nav_bar.addTab("Audio")
         self._nav_bar.addTab("Player")
         self._nav_bar.addTab("Log")
@@ -140,17 +141,22 @@ class MainWindow(QMainWindow):
         timestamp_placeholder = QWidget()
         self._pages.addWidget(timestamp_placeholder)
 
-        # --- Page 3: Audio (lazy-loaded) ---
+        # --- Page 3: GOP (lazy-loaded) ---
+        self._gop_page = None
+        gop_placeholder = QWidget()
+        self._pages.addWidget(gop_placeholder)
+
+        # --- Page 4: Audio (lazy-loaded) ---
         self._audio_page = None
         audio_placeholder = QWidget()
         self._pages.addWidget(audio_placeholder)
 
-        # --- Page 4: Player (lazy-loaded) ---
+        # --- Page 5: Player (lazy-loaded) ---
         self._player_page = None
         player_placeholder = QWidget()  # Placeholder until first use
         self._pages.addWidget(player_placeholder)
 
-        # --- Page 5: Log (created immediately to capture from start) ---
+        # --- Page 6: Log (created immediately to capture from start) ---
         from media_analyzer.ui.log_page import LogPage
         self._log_page = LogPage()
         self._pages.addWidget(self._log_page)
@@ -832,11 +838,15 @@ class MainWindow(QMainWindow):
             self._ensure_timestamp_page()
             self._load_timestamp_data()
         elif index == 3:
+            # GOP page — lazy load
+            self._ensure_gop_page()
+            self._load_gop_data()
+        elif index == 4:
             # Audio page — lazy load
             self._ensure_audio_page()
             if self._audio_page and self._current_file_path:
                 self._audio_page.load_file(self._current_file_path)
-        elif index == 4:
+        elif index == 5:
             # Player page — lazy load
             self._ensure_player_page()
             # Pass URL/path + source for MediaInfo temp file fallback
@@ -974,17 +984,46 @@ class MainWindow(QMainWindow):
             packets = self._all_packets
             self._timestamp_page.load_packets(packets, self._stream_info)
 
+    def _ensure_gop_page(self):
+        """Create the GOP page on first use."""
+        if self._gop_page is not None:
+            return
+        from media_analyzer.ui.gop_page import GOPPage
+        self._gop_page = GOPPage()
+        # Replace placeholder at index 3
+        old = self._pages.widget(3)
+        self._pages.removeWidget(old)
+        old.deleteLater()
+        self._pages.insertWidget(3, self._gop_page)
+
+    def _load_gop_data(self):
+        """Feed packet data to the GOP page."""
+        if not self._gop_page:
+            return
+
+        # RTMP mode: start live update
+        if self._rtmp_view and self._rtmp_worker:
+            packets = self._rtmp_view._flv_model._packets
+            self._gop_page.load_packets(packets)
+            self._gop_page.start_live_mode(
+                packets_fn=lambda: self._rtmp_view._flv_model._packets if self._rtmp_view else []
+            )
+        else:
+            # Static file mode
+            self._gop_page.stop_live_mode()
+            self._gop_page.load_packets(self._all_packets, self._stream_info)
+
     def _ensure_audio_page(self):
         """Create the audio page on first use."""
         if self._audio_page is not None:
             return
         from media_analyzer.ui.audio_page import AudioPage
         self._audio_page = AudioPage()
-        # Replace placeholder at index 3
-        old = self._pages.widget(3)
+        # Replace placeholder at index 4
+        old = self._pages.widget(4)
         self._pages.removeWidget(old)
         old.deleteLater()
-        self._pages.insertWidget(3, self._audio_page)
+        self._pages.insertWidget(4, self._audio_page)
 
     def _ensure_player_page(self):
         """Create the player page on first use."""
@@ -992,11 +1031,11 @@ class MainWindow(QMainWindow):
             return
         from media_analyzer.ui.player_page import PlayerPage
         self._player_page = PlayerPage()
-        # Replace placeholder at index 4
-        old = self._pages.widget(4)
+        # Replace placeholder at index 5
+        old = self._pages.widget(5)
         self._pages.removeWidget(old)
         old.deleteLater()
-        self._pages.insertWidget(4, self._player_page)
+        self._pages.insertWidget(5, self._player_page)
 
     # --- View Switching ---
 

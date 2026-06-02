@@ -527,8 +527,13 @@ class SpectrogramWidget(QWidget):
     def _start_compute(self):
         """Start spectrogram computation in background thread."""
         if hasattr(self, '_compute_thread') and self._compute_thread is not None:
-            self._compute_thread.quit()
-            self._compute_thread.wait(1000)
+            if self._compute_thread.isRunning():
+                # Disconnect to avoid stale signals, wait for completion
+                try:
+                    self._compute_thread.finished.disconnect(self._on_compute_done)
+                except RuntimeError:
+                    pass
+                self._compute_thread.wait()
 
         from PySide6.QtCore import QThread
 
@@ -1148,3 +1153,8 @@ class AudioPage(QWidget):
         if self._decode_worker and self._decode_worker.isRunning():
             self._decode_worker.stop()
             self._decode_worker.wait(3000)
+        # Wait for spectrogram background thread
+        spec = self._spectrogram
+        if hasattr(spec, '_compute_thread') and spec._compute_thread is not None:
+            if spec._compute_thread.isRunning():
+                spec._compute_thread.wait(5000)

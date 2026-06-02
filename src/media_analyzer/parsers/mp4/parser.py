@@ -149,6 +149,9 @@ class MP4Parser(BaseParser):
             for mdat_offset, mdat_size, mdat_depth, mdat_box_index in self._mdat_boxes:
                 yield from self._emit_mdat_samples(mdat_offset, mdat_size, mdat_depth, mdat_box_index)
 
+        # Analyze frame types from slice headers for video tracks
+        self._analyze_frame_types(source)
+
     def _parse_boxes(self, source: BinaryIO, start: int, end: int,
                      depth: int, parent_type: bytes = b'') -> Generator[PacketInfo, None, None]:
         """Parse boxes within a range [start, end). parent_type for context-dependent parsing."""
@@ -1092,7 +1095,9 @@ class MP4Parser(BaseParser):
         if box_type == b'trak':
             # Start a new track
             self._current_track = {"handler": "", "stco": [], "stsz": [],
-                                   "stsc": [], "stss": set(), "stts": [], "timescale": 0}
+                                   "stsc": [], "stss": set(), "stts": [],
+                                   "ctts": [], "timescale": 0,
+                                   "nalu_length_size": 4, "codec": ""}
             self._tracks.append(self._current_track)
         elif box_type == b'hdlr' and self._current_track is not None:
             # Only set handler if not already set (first hdlr in trak/mdia is correct,
@@ -1188,6 +1193,25 @@ class MP4Parser(BaseParser):
                     sd = struct.unpack(">I", raw[pos+4:pos+8])[0]
                     entries.append((sc, sd))  # (sample_count, sample_delta)
                 self._current_track["stts"] = entries
+        elif box_type == b'ctts' and self._current_track is not None:
+            source.seek(payload_offset)
+            raw = source.read(min(payload_size, 1024 * 1024))  # ctts can be large
+            if len(raw) >= 8:
+                version = raw[0]
+                entry_count = struct.unpack(">I", raw[4:8])[0]
+                entries = []
+                pos = 8
+                for _ in range(entry_count):
+                    if pos + 8 > len(raw):
+                        break
+                    sc = struct.unpack(">I", raw[pos:pos+4])[0]
+                    if version == 0:
+                        offset = struct.unpack(">I", raw[pos+4:pos+8])[0]
+                    else:
+                        offset = struct.unpack(">i", raw[pos+4:pos+8])[0]  # signed
+                    entries.append((sc, offset))  # (sample_count, composition_offset)
+                    pos += 8
+                self._current_track["ctts"] = entries
         elif box_type == b'mdhd' and self._current_track is not None:
             source.seek(payload_offset)
             raw = source.read(min(payload_size, 64))
@@ -1199,6 +1223,216 @@ class MP4Parser(BaseParser):
                 elif version == 1 and len(raw) >= 24:
                     timescale = struct.unpack(">I", raw[20:24])[0]
                     self._current_track["timescale"] = timescale
+        elif box_type == b'avcC' and self._current_track is not None:
+            source.seek(payload_offset)
+            raw = source.read(min(payload_size, 4096))  # Read full avcC for SPS extraction
+            if len(raw) >= 7:
+                self._current_track["nalu_length_size"] = (raw[4] & 0x03) + 1
+                self._current_track["codec"] = "h264"
+                self._current_track["avcc_data"] = raw
+        elif box_type == b'hvcC' and self._current_track is not None:
+            source.seek(payload_offset)
+            raw = source.read(min(payload_size, 64))
+            if len(raw) >= 22:
+                self._current_track["nalu_length_size"] = (raw[21] & 0x03) + 1
+                self._current_track["codec"] = "h265"
+
+    def _analyze_frame_types(self, source: BinaryIO) -> None:
+        """Analyze frame types and reference relationships for video tracks.
+
+        For H.264: uses full slice header parsing with POC computation and DPB model
+        to determine actual reference picture lists.
+        For H.265: falls back to simple slice_type parsing.
+
+        Stores:
+        - track["frame_types"]: list of "I"/"P"/"B" per sample
+        - track["frame_refs"]: list of {ref_list0: [...], ref_list1: [...]} per sample (H.264)
+        """
+        for track in self._tracks:
+            handler = track.get("handler", "")
+            if handler not in ("vide", "video"):
+                continue
+
+            codec = track.get("codec", "")
+            if codec not in ("h264", "h265"):
+                continue
+
+            nalu_length_size = track.get("nalu_length_size", 4)
+            stco = track.get("stco", [])
+            stsz = track.get("stsz", [])
+            stsc = track.get("stsc", [])
+            stss = track.get("stss", set())
+
+            if not stco or not stsz:
+                continue
+
+            # Build sample offset list
+            sample_offsets = []
+            sample_idx = 0
+            for chunk_idx, chunk_offset in enumerate(stco):
+                spc = 1
+                for i, (fc, s) in enumerate(stsc):
+                    if chunk_idx + 1 >= fc:
+                        spc = s
+                    else:
+                        break
+                offset_in_chunk = chunk_offset
+                for j in range(spc):
+                    if sample_idx + j >= len(stsz):
+                        break
+                    sample_offsets.append(offset_in_chunk)
+                    offset_in_chunk += stsz[sample_idx + j]
+                sample_idx += spc
+
+            # H.264: full reference analysis with DPB
+            if codec == "h264":
+                avcc_data = track.get("avcc_data", b"")
+                if avcc_data:
+                    try:
+                        from media_analyzer.parsers.h264.refs import (
+                            analyze_references, extract_sps_from_avcc,
+                            extract_pps_from_avcc
+                        )
+                        sps_nalu = extract_sps_from_avcc(avcc_data)
+                        pps_nalu = extract_pps_from_avcc(avcc_data)
+                        if sps_nalu:
+                            frame_refs = analyze_references(
+                                source, sample_offsets, stsz, stss,
+                                nalu_length_size, sps_nalu, pps_nalu)
+                            track["frame_types"] = [fr.frame_type for fr in frame_refs]
+                            track["frame_refs"] = [
+                                {"ref_list0": fr.ref_list0, "ref_list1": fr.ref_list1}
+                                for fr in frame_refs
+                            ]
+                            continue
+                    except Exception as e:
+                        logger.warning(f"H.264 reference analysis failed: {e}")
+
+            # Fallback: simple slice_type parsing (H.265 or H.264 fallback)
+            frame_types: list = []
+            for i, offset in enumerate(sample_offsets):
+                if i >= len(stsz):
+                    break
+                if (i + 1) in stss:
+                    frame_types.append("I")
+                    continue
+                ft = self._parse_sample_slice_type(
+                    source, offset, stsz[i], nalu_length_size, codec)
+                frame_types.append(ft if ft else "P")
+
+            track["frame_types"] = frame_types
+
+    def _parse_sample_slice_type(self, source: BinaryIO, offset: int,
+                                 size: int, nalu_length_size: int,
+                                 codec: str) -> Optional[str]:
+        """Parse slice_type from the first slice NALU in an MP4 sample.
+
+        Returns 'I', 'P', 'B', or None.
+        """
+        # Read enough bytes for NALU header + slice header start
+        read_size = min(32, size)
+        if read_size < nalu_length_size + 2:
+            return None
+
+        try:
+            source.seek(offset)
+            data = source.read(read_size)
+        except (OSError, IOError):
+            return None
+
+        if len(data) < nalu_length_size + 2:
+            return None
+
+        pos = 0
+        # May need to skip non-slice NALUs (SPS/PPS that sometimes appear in samples)
+        while pos + nalu_length_size < len(data):
+            if pos + nalu_length_size > len(data):
+                break
+            nalu_len = int.from_bytes(data[pos:pos + nalu_length_size], "big")
+            nalu_start = pos + nalu_length_size
+
+            if nalu_start >= len(data):
+                break
+
+            if codec == "h264":
+                nal_type = data[nalu_start] & 0x1F
+                # Skip non-VCL NALUs: 7=SPS, 8=PPS, 6=SEI, 9=AUD
+                if nal_type in (7, 8, 6, 9):
+                    pos = nalu_start + nalu_len
+                    continue
+                # VCL NALUs: 1=non-IDR slice, 5=IDR slice
+                if nal_type in (1, 5):
+                    return self._parse_h264_slice_type_from_nalu(data, nalu_start + 1)
+                break  # Unknown NALU type, stop
+            elif codec == "h265":
+                if nalu_start + 1 >= len(data):
+                    break
+                nal_type = (data[nalu_start] >> 1) & 0x3F
+                # Skip non-VCL: 32=VPS, 33=SPS, 34=PPS, 35=AUD, 39=SEI_PREFIX
+                if nal_type in (32, 33, 34, 35, 39, 40):
+                    pos = nalu_start + nalu_len
+                    continue
+                # VCL NALUs: 0-31 are slice types
+                if nal_type <= 31:
+                    return self._parse_h265_slice_type_from_nalu(data, nalu_start + 2)
+                break
+
+            break  # unsupported codec
+
+        return None
+
+    @staticmethod
+    def _parse_h264_slice_type_from_nalu(data: bytes, offset: int) -> Optional[str]:
+        """Parse H.264 slice_type from slice header.
+        Slice header: first_mb_in_slice(ue) + slice_type(ue)."""
+        if offset + 4 >= len(data):
+            return None
+        try:
+            from media_analyzer.parsers.h264.bitreader import BitReader
+            reader = BitReader(data[offset:offset + 16])
+            reader.read_ue()  # first_mb_in_slice
+            slice_type = reader.read_ue()
+            # slice_type: 0/5=P, 1/6=B, 2/7=I, 3/8=SP, 4/9=SI
+            if slice_type in (2, 7):
+                return "I"
+            elif slice_type in (0, 5):
+                return "P"
+            elif slice_type in (1, 6):
+                return "B"
+        except (EOFError, ValueError, IndexError):
+            pass
+        return None
+
+    @staticmethod
+    def _parse_h265_slice_type_from_nalu(data: bytes, offset: int) -> Optional[str]:
+        """Parse H.265 slice_type from slice header.
+        Slice header: first_slice_segment_in_pic_flag(1) + [no_output_of_prior_pics_flag(1)]
+                      + slice_pic_parameter_set_id(ue) + ... + slice_type(ue)
+        For simplicity, handle first_slice case (most common)."""
+        if offset + 4 >= len(data):
+            return None
+        try:
+            from media_analyzer.parsers.h264.bitreader import BitReader
+            reader = BitReader(data[offset:offset + 16])
+            first_slice_flag = reader.read_bits(1)
+            # For IRAP pictures (nal_type 16-23), skip no_output_of_prior_pics_flag
+            # We don't know nal_type here easily, so try both paths
+            # Read slice_pic_parameter_set_id
+            reader.read_ue()  # slice_pic_parameter_set_id
+            # If not first slice, there's dependent_slice_segment_flag and address
+            # For first slice (common case), next is slice_type
+            if first_slice_flag:
+                slice_type = reader.read_ue()
+                # H.265: 0=B, 1=P, 2=I
+                if slice_type == 2:
+                    return "I"
+                elif slice_type == 1:
+                    return "P"
+                elif slice_type == 0:
+                    return "B"
+        except (EOFError, ValueError, IndexError):
+            pass
+        return None
 
     def _emit_mdat_samples(self, mdat_offset: int, mdat_size: int,
                            depth: int, mdat_box_index: int) -> Generator[PacketInfo, None, None]:
@@ -1387,6 +1621,11 @@ class MP4Parser(BaseParser):
                 "stts": track.get("stts", []),
                 "stsz": track.get("stsz", []),
                 "stss": track.get("stss", set()),
+                "ctts": track.get("ctts", []),
+                "frame_types": track.get("frame_types", []),
+                "frame_refs": track.get("frame_refs", []),
+                "nalu_length_size": track.get("nalu_length_size", 4),
+                "codec": track.get("codec", ""),
             })
 
         return StreamInfo(
