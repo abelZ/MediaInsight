@@ -4,7 +4,7 @@ import logging
 import subprocess
 import shutil
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
@@ -23,12 +23,14 @@ class AudioDecodeWorker(QThread):
     error = Signal(str)
     progress = Signal(str)  # Status message
 
+    # Max decode duration (10 minutes)
+    MAX_DURATION = 600.0
+
     def __init__(self, file_path: str, sample_rate: int = 44100,
-                 max_duration: Optional[float] = None, parent=None):
+                 parent=None):
         super().__init__(parent)
         self._file_path = file_path
         self._sample_rate = sample_rate
-        self._max_duration = max_duration  # Limit decode length (seconds)
         self._running = True
 
     def run(self):
@@ -48,18 +50,18 @@ class AudioDecodeWorker(QThread):
 
             self.progress.emit(f"Decoding audio ({channels}ch, {self._sample_rate}Hz)...")
 
-            # Step 2: Decode to raw PCM float32
+            # Step 2: Decode to raw PCM float32 (max 10 minutes)
             cmd = [
                 ffmpeg, "-i", self._file_path,
                 "-vn",  # No video
+                "-t", str(self.MAX_DURATION),  # Limit to 10 minutes
                 "-f", "f32le",  # Raw float32 little-endian
                 "-acodec", "pcm_f32le",
                 "-ar", str(self._sample_rate),
                 "-ac", str(channels),
+                "-loglevel", "error",
+                "pipe:1",
             ]
-            if self._max_duration:
-                cmd.extend(["-t", str(self._max_duration)])
-            cmd.extend(["-loglevel", "error", "pipe:1"])
 
             logger.info(f"FFmpeg decode: {' '.join(cmd)}")
 

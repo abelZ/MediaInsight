@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
         self._ts_pes_view = None
         self._rtmp_view = None  # RTMPDualView widget (created on demand)
         self._hls_view = None  # HLS segment list view (created on demand)
+        self._hls_mediainfo_path: Optional[str] = None  # Cached first segment for MediaInfo
         self._current_file_path: Optional[str] = None  # Current file path for player page
         self._all_packets: List[PacketInfo] = []  # All packets for bitrate analysis (all formats)
 
@@ -687,13 +688,12 @@ class MainWindow(QMainWindow):
         # Mark as downloading
         self._hls_view.set_segment_status(segment.index, "downloading")
 
-        # Clear right-side views
+        # Clear previous segment data (but keep HLS layout intact)
         self._table_model.clear()
         self._all_packets.clear()
         self._detail_panel.clear()
         self._hex_view.clear()
         self._format_detected = False
-        self._swap_to_table_view()  # Ensure table view (not box tree)
 
         # Start download + parse
         self._hls_segment_worker = HLSSegmentWorker(segment.uri, self)
@@ -717,6 +717,21 @@ class MainWindow(QMainWindow):
         self._stream_info = stream_info
         self._progress_bar.hide()
         self._hls_view.set_segment_status(segment_index, "loaded")
+
+        # Cache first segment as temp file for MediaInfo
+        if not hasattr(self, '_hls_mediainfo_path') or self._hls_mediainfo_path is None:
+            if hasattr(self, '_hls_segment_worker') and self._hls_segment_worker:
+                source = self._hls_segment_worker.source
+                if source and source.size > 0:
+                    import tempfile, os
+                    ext = os.path.splitext(source.name)[1] or ".ts"
+                    tmp = tempfile.NamedTemporaryFile(
+                        suffix=ext, delete=False, prefix="mediainsight_hls_")
+                    reader = source.open()
+                    reader.seek(0)
+                    tmp.write(reader.read())
+                    tmp.close()
+                    self._hls_mediainfo_path = tmp.name
 
         count = self._table_model.packet_count
         self._status_label.setText(
@@ -780,6 +795,14 @@ class MainWindow(QMainWindow):
             self._hls_segment_worker.stop()
             self._hls_segment_worker.wait(3000)
             self._hls_segment_worker = None
+        # Clean up temp file
+        if hasattr(self, '_hls_mediainfo_path') and self._hls_mediainfo_path:
+            import os
+            try:
+                os.unlink(self._hls_mediainfo_path)
+            except OSError:
+                pass
+            self._hls_mediainfo_path = None
         # Restore splitter to 2 widgets: [table_view, right_splitter]
         self._table_view.show()
         self._main_splitter.setSizes([800, 450])
@@ -867,6 +890,10 @@ class MainWindow(QMainWindow):
         # Local file: use directly
         if not path.startswith("http") and not path.startswith("rtmp"):
             return path
+
+        # HLS: use cached first segment
+        if hasattr(self, '_hls_mediainfo_path') and self._hls_mediainfo_path:
+            return self._hls_mediainfo_path
 
         # HTTP stream with downloaded data: save to temp file
         if self._worker:
@@ -1328,7 +1355,8 @@ class MainWindow(QMainWindow):
     def _on_packets_ready(self, packets):
         """Handle batch of parsed packets from worker."""
         # Early format detection: auto-adapt columns and view based on format
-        if not self._format_detected and packets:
+        # Skip format detection in HLS mode (HLS has its own view layout)
+        if not self._format_detected and packets and self._hls_view is None:
             self._format_detected = True
             first_pkt = packets[0]
             if first_pkt.script_data and "pid" in first_pkt.script_data:

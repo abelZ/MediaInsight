@@ -117,13 +117,19 @@ class WaveformWidget(QWidget):
         self._channel_visible: List[bool] = []
         self._channel_names: List[str] = []
 
-        # View range (in samples)
+        # View range (in samples, full-file virtual coordinates)
         self._view_start: int = 0
         self._view_end: int = 0  # Total samples
         self._total_samples: int = 0
 
-        # Playback cursor (sample index)
+        # Loaded segment offset (PCM index 0 corresponds to this file sample)
+        self._loaded_start: int = 0
+
+        # Playback cursor (sample index, full-file coordinates)
         self._cursor_pos: int = 0
+
+        # Max view width (set by AudioPage to limit zoom-out)
+        self._max_view_samples: int = 0  # 0 = no limit
 
         self.setMinimumHeight(100)
         self.setMouseTracking(True)
@@ -185,6 +191,9 @@ class WaveformWidget(QWidget):
         view_len = self._view_end - self._view_start
         new_len = max(1000, int(view_len / factor))
         new_len = min(new_len, self._total_samples)
+        # Limit max zoom-out to MAX_SEGMENT size
+        if self._max_view_samples > 0:
+            new_len = min(new_len, self._max_view_samples)
 
         # Zoom centered on mouse position or center of view
         if center_pixel is not None:
@@ -277,13 +286,29 @@ class WaveformWidget(QWidget):
             pen.setWidth(1)
             painter.setPen(pen)
 
-            pcm_ch = self._pcm[self._view_start:self._view_end, ch]
+            # Map view range to loaded PCM data
+            # view covers [_view_start, _view_end) in virtual coords
+            # loaded PCM covers [_loaded_start, _loaded_start + len(pcm)) in virtual coords
+            # For each pixel, compute which virtual sample it maps to,
+            # then check if that sample is within the loaded range
             for px in range(draw_w):
-                s_start = px * view_len // draw_w
-                s_end = min(s_start + samples_per_pixel, len(pcm_ch))
-                if s_start >= s_end:
+                # Virtual sample range for this pixel
+                vs_start = self._view_start + px * view_len // draw_w
+                vs_end = vs_start + samples_per_pixel
+
+                # Clamp to loaded range
+                cs_start = max(vs_start, self._loaded_start)
+                cs_end = min(vs_end, self._loaded_start + len(self._pcm))
+
+                if cs_start >= cs_end:
+                    continue  # No loaded data for this pixel
+
+                # Convert to local PCM index
+                ls = cs_start - self._loaded_start
+                le = cs_end - self._loaded_start
+                chunk = self._pcm[ls:le, ch]
+                if len(chunk) == 0:
                     continue
-                chunk = pcm_ch[s_start:s_end]
                 mn = float(chunk.min())
                 mx = float(chunk.max())
                 y1 = y_center - int(mx * half_h)
@@ -489,7 +514,10 @@ class SpectrogramWidget(QWidget):
         self._channel_visible: List[bool] = []
         self._total_samples: int = 0
 
-        # View range (synced with waveform)
+        # Loaded segment offset
+        self._loaded_start: int = 0
+
+        # View range (synced with waveform, full-file coordinates)
         self._view_start: int = 0
         self._view_end: int = 0
 
@@ -617,10 +645,12 @@ class SpectrogramWidget(QWidget):
         num_channels = self._channels
         ch_height = h // num_channels
 
-        # Get frame range for current view
+        # Get frame range for current view (translate to local segment coordinates)
         n_freq, n_frames = self._spec_data[0].shape
-        frame_start = int(self._view_start / self._hop_size)
-        frame_end = int(self._view_end / self._hop_size)
+        local_view_start = max(0, self._view_start - self._loaded_start)
+        local_view_end = max(0, self._view_end - self._loaded_start)
+        frame_start = int(local_view_start / self._hop_size)
+        frame_end = int(local_view_end / self._hop_size)
         frame_start = max(0, min(frame_start, n_frames - 1))
         frame_end = max(frame_start + 1, min(frame_end, n_frames))
         view_frames = frame_end - frame_start
@@ -761,6 +791,9 @@ class SpectrogramWidget(QWidget):
         view_len = self._view_end - self._view_start
         new_len = max(1000, int(view_len / factor))
         new_len = min(new_len, self._total_samples)
+        # Limit max zoom-out to loaded segment size
+        if hasattr(self, '_max_view_samples') and self._max_view_samples > 0:
+            new_len = min(new_len, self._max_view_samples)
 
         ratio = center_px / draw_w if draw_w > 0 else 0.5
         center_sample = self._view_start + int(view_len * ratio)
@@ -783,7 +816,7 @@ class AudioPage(QWidget):
     """
     Audio waveform analysis page.
 
-    - Decodes audio via FFmpeg to PCM float32
+    - Decodes audio via FFmpeg to PCM float32 (max 10 minutes)
     - Displays multi-channel waveform (peak envelope)
     - Playback via sounddevice with position cursor sync
     - Channel enable/disable toggles
@@ -904,7 +937,7 @@ class AudioPage(QWidget):
         layout.addWidget(self._scrollbar)
 
     def load_file(self, file_path: str):
-        """Decode audio from file and display waveform."""
+        """Decode audio from file and display waveform (max 10 minutes)."""
         if not file_path:
             return
         if file_path == self._loaded_path:
@@ -912,7 +945,7 @@ class AudioPage(QWidget):
 
         self._stop()
         self._file_path = file_path
-        self._status_label.setText("Decoding audio...")
+        self._status_label.setText("Decoding audio (max 10 min)...")
 
         # Start background decode
         from media_analyzer.workers.audio_decode_worker import AudioDecodeWorker
@@ -1062,7 +1095,6 @@ class AudioPage(QWidget):
 
     def _on_playback_finished(self):
         """Called when playback reaches end."""
-        # Schedule UI update in main thread
         QTimer.singleShot(0, self._playback_ended)
 
     def _playback_ended(self):
@@ -1158,3 +1190,4 @@ class AudioPage(QWidget):
         if hasattr(spec, '_compute_thread') and spec._compute_thread is not None:
             if spec._compute_thread.isRunning():
                 spec._compute_thread.wait(5000)
+
