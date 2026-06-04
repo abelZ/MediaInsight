@@ -46,8 +46,18 @@ if [ -d "dist/MediaInsight.app" ]; then
     else
         echo "VLC: NOT bundled (player requires system VLC or VLC.app installed)"
     fi
+
+    # Package as ZIP for distribution
     echo ""
-    echo "To install: drag MediaInsight.app to /Applications"
+    echo "Packaging ZIP..."
+    rm -f dist/MediaInsight-macOS.zip
+    cd dist
+    zip -r -y -q MediaInsight-macOS.zip MediaInsight.app
+    cd ..
+    ZIP_SIZE=$(du -h dist/MediaInsight-macOS.zip | cut -f1)
+    echo "Output: dist/MediaInsight-macOS.zip ($ZIP_SIZE)"
+    echo ""
+    echo "To install: unzip and drag MediaInsight.app to /Applications"
 elif [ -d "dist/MediaInsight" ]; then
     echo "=== Build successful! ==="
     echo "Output: dist/MediaInsight/"

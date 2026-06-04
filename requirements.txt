@@ -3,3 +3,5 @@ pymediainfo>=6.0
 python-vlc>=3.0
 numpy>=1.20
 sounddevice>=0.4
+Pillow>=9.0
+pyinstaller>=6.0
