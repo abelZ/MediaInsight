@@ -1313,10 +1313,13 @@ class MainWindow(QMainWindow):
 
     def _start_parsing(self, source):
         """Start parsing a data source in background thread."""
-        # Stop any existing worker
+        # Stop any existing worker and close its source
         if self._worker and self._worker.isRunning():
             self._worker.stop()
             self._worker.wait(3000)
+        if self._worker and self._worker.source:
+            self._worker.source.close()
+        self._worker = None
 
         # Stop RTMP if active
         self._stop_rtmp()

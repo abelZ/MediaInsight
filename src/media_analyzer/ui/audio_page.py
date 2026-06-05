@@ -1028,11 +1028,15 @@ class AudioPage(QWidget):
         self._btn_play.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
+        # Always output stereo (2ch) — most sound devices don't support >2 channels
+        # Multi-channel audio will be downmixed in _audio_callback
+        output_channels = min(2, self._channels)
+
         # Create output stream
         try:
             self._stream = sd.OutputStream(
                 samplerate=self._sample_rate,
-                channels=self._channels,
+                channels=output_channels,
                 dtype='float32',
                 callback=self._audio_callback,
                 finished_callback=self._on_playback_finished,
@@ -1065,7 +1069,8 @@ class AudioPage(QWidget):
             self._update_time_display(0, len(self._pcm) / self._sample_rate)
 
     def _audio_callback(self, outdata, frames, time_info, status):
-        """sounddevice callback — fill output buffer with PCM data."""
+        """sounddevice callback — fill output buffer with PCM data.
+        Downmixes multi-channel to stereo for output."""
         if self._pcm is None:
             outdata.fill(0)
             raise sd.CallbackStop()
@@ -1079,19 +1084,49 @@ class AudioPage(QWidget):
 
         if end > total:
             valid = total - self._play_position
-            outdata[:valid] = self._pcm[self._play_position:total]
+            chunk = self._pcm[self._play_position:total]
+            mixed = self._downmix(chunk)
+            outdata[:valid] = mixed
             outdata[valid:] = 0
             self._play_position = total
             raise sd.CallbackStop()
 
-        # Apply channel muting
+        # Get source data and apply channel muting
         data = self._pcm[self._play_position:end].copy()
         for ch in range(self._channels):
             if ch < len(self._waveform._channel_visible) and not self._waveform._channel_visible[ch]:
                 data[:, ch] = 0
 
-        outdata[:] = data
+        # Downmix to output channels (stereo)
+        outdata[:] = self._downmix(data)
         self._play_position = end
+
+    def _downmix(self, data: np.ndarray) -> np.ndarray:
+        """Downmix multi-channel audio to stereo (or mono to stereo)."""
+        n_ch = data.shape[1] if data.ndim == 2 else 1
+        if n_ch <= 2:
+            return data  # Already stereo or mono
+
+        # Simple downmix: average enabled channels into L/R
+        # For standard layouts: L = (FL + FC*0.707 + BL*0.5) / norm
+        # Simplified: just take mean of odd-indexed channels → L, even → R
+        # More robust: average all channels into both L and R
+        left = data[:, 0].copy()  # Start with FL
+        right = data[:, 1].copy() if n_ch > 1 else left.copy()  # FR
+
+        # Mix in center and surround channels
+        for ch in range(2, n_ch):
+            contribution = data[:, ch] * 0.5  # -6dB for surround/center mix
+            left += contribution
+            right += contribution
+
+        # Normalize to prevent clipping
+        mix = np.column_stack([left, right])
+        peak = np.abs(mix).max()
+        if peak > 1.0:
+            mix /= peak
+
+        return mix
 
     def _on_playback_finished(self):
         """Called when playback reaches end."""
