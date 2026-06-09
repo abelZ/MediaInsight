@@ -71,6 +71,17 @@ if exist dist\MediaInsight\MediaInsight.exe (
         echo VLC: NOT bundled ^(player requires system VLC^)
     )
     echo.
+
+    REM Package as ZIP for distribution
+    echo Packaging ZIP...
+    if exist dist\MediaInsight-Windows.zip del /f dist\MediaInsight-Windows.zip
+    tar -a -c -f dist\MediaInsight-Windows.zip -C dist MediaInsight
+    if exist dist\MediaInsight-Windows.zip (
+        echo Output: dist\MediaInsight-Windows.zip
+    ) else (
+        echo WARNING: ZIP packaging failed.
+    )
+    echo.
     echo Run: dist\MediaInsight\MediaInsight.exe
 ) else (
     echo === Build FAILED ===

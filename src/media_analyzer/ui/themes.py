@@ -585,6 +585,40 @@ QMenu::indicator {{
     margin-left: 4px;
 }}
 
+/* Tab Bar (Navigation) */
+QTabBar {{
+    background-color: {theme.bg_secondary};
+    border: none;
+    qproperty-drawBase: 0;
+}}
+QTabBar::tab {{
+    background-color: {theme.bg_tertiary};
+    color: {theme.fg_secondary};
+    padding: 6px 16px;
+    margin: 4px 2px 4px 2px;
+    border: 1px solid {theme.border};
+    border-radius: 4px;
+}}
+QTabBar::tab:hover {{
+    background-color: {theme.hover_bg};
+    color: {theme.fg_primary};
+    border-color: {theme.border_light};
+}}
+QTabBar::tab:selected {{
+    background-color: {theme.selection_bg};
+    color: {theme.fg_accent};
+    border: 1px solid {theme.border_light};
+}}
+
+/* Tab Widget (Container Tabs) */
+QTabWidget::pane {{
+    border: 1px solid {theme.border};
+    background-color: {theme.bg_primary};
+}}
+QTabWidget::tab-bar {{
+    alignment: left;
+}}
+
 /* Status Bar */
 QStatusBar {{
     background-color: {theme.bg_primary};
