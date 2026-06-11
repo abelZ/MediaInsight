@@ -55,6 +55,8 @@ elif sys.platform == 'darwin':
         if os.path.isdir(plugins_dir):
             vlc_datas.append((plugins_dir, os.path.join('vlc', 'plugins')))
 
+    # Bundle FFmpeg binaries — no longer needed, using PyAV (linked library)
+
 # --- Data files ---
 datas = [
     (os.path.join(RESOURCES_DIR, 'icons'), os.path.join('resources', 'icons')),
@@ -130,6 +132,7 @@ hiddenimports = [
     'media_analyzer.workers.audio_decode_worker',
     # Third-party
     'pymediainfo',
+    'av',
 ]
 
 # --- Analysis ---

@@ -1,10 +1,8 @@
-"""Audio decode worker — runs FFmpeg to decode audio to PCM."""
+"""Audio decode worker — decodes audio to PCM using PyAV (FFmpeg binding)."""
 
 import logging
-import subprocess
-import shutil
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
@@ -14,7 +12,7 @@ logger = logging.getLogger(__name__)
 class AudioDecodeWorker(QThread):
     """
     Background thread that decodes audio from any format to PCM float32
-    using FFmpeg subprocess.
+    using PyAV (python binding for FFmpeg libraries).
 
     Emits finished(numpy_array, sample_rate, num_channels, channel_layout) on success.
     """
@@ -34,61 +32,95 @@ class AudioDecodeWorker(QThread):
         self._running = True
 
     def run(self):
-        # Find ffmpeg
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            self.error.emit("FFmpeg not found. Install FFmpeg and add to PATH.")
+        try:
+            import av
+        except ImportError:
+            self.error.emit("PyAV not installed. Run: pip install av")
             return
 
         try:
-            # Step 1: Probe channel count and layout
-            channels, channel_layout = self._probe_audio_info(ffmpeg)
-            if not self._running:
+            container = av.open(self._file_path)
+        except Exception as e:
+            self.error.emit(f"Cannot open file: {e}")
+            return
+
+        try:
+            # Find the first audio stream
+            audio_streams = [s for s in container.streams if s.type == 'audio']
+            if not audio_streams:
+                self.error.emit("No audio track found in file")
+                container.close()
                 return
-            if channels <= 0:
-                channels = 2  # Default to stereo
+
+            stream = audio_streams[0]
+            channels = stream.channels or 2
+            channel_layout = str(stream.layout) if stream.layout else ""
 
             self.progress.emit(f"Decoding audio ({channels}ch, {self._sample_rate}Hz)...")
 
-            # Step 2: Decode to raw PCM float32 (max 10 minutes)
-            cmd = [
-                ffmpeg, "-i", self._file_path,
-                "-vn",  # No video
-                "-t", str(self.MAX_DURATION),  # Limit to 10 minutes
-                "-f", "f32le",  # Raw float32 little-endian
-                "-acodec", "pcm_f32le",
-                "-ar", str(self._sample_rate),
-                "-ac", str(channels),
-                "-loglevel", "error",
-                "pipe:1",
-            ]
-
-            logger.info(f"FFmpeg decode: {' '.join(cmd)}")
-
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            # Set up resampler: convert to float32 planar at target sample rate
+            resampler = av.AudioResampler(
+                format='fltp',  # float32 planar
+                layout=stream.layout or 'stereo',
+                rate=self._sample_rate,
             )
 
-            stdout_data, stderr_data = proc.communicate()
+            # Decode frames
+            max_samples = int(self.MAX_DURATION * self._sample_rate)
+            all_frames = []
+            total_samples = 0
+
+            for packet in container.demux(stream):
+                if not self._running:
+                    container.close()
+                    return
+
+                for frame in packet.decode():
+                    # Resample
+                    resampled = resampler.resample(frame)
+                    for r_frame in resampled if isinstance(resampled, list) else [resampled]:
+                        if r_frame is None:
+                            continue
+                        # Convert to numpy: shape (channels, samples)
+                        arr = r_frame.to_ndarray()
+                        all_frames.append(arr)
+                        total_samples += arr.shape[1] if arr.ndim == 2 else arr.shape[0]
+
+                        if total_samples >= max_samples:
+                            break
+
+                if total_samples >= max_samples:
+                    break
+
+            # Flush resampler
+            if self._running:
+                resampled = resampler.resample(None)
+                for r_frame in resampled if isinstance(resampled, list) else [resampled]:
+                    if r_frame is not None:
+                        arr = r_frame.to_ndarray()
+                        all_frames.append(arr)
+
+            container.close()
 
             if not self._running:
                 return
 
-            if proc.returncode != 0:
-                err_msg = stderr_data.decode("utf-8", errors="replace").strip()
-                self.error.emit(f"FFmpeg decode failed: {err_msg[:200]}")
-                return
-
-            if len(stdout_data) == 0:
+            if not all_frames:
                 self.error.emit("No audio data decoded (file may have no audio track)")
                 return
 
-            # Step 3: Convert to numpy array
-            pcm = np.frombuffer(stdout_data, dtype=np.float32)
-            pcm = pcm.reshape(-1, channels)
+            # Concatenate all frames: (channels, total_samples)
+            pcm_planar = np.concatenate(all_frames, axis=1 if all_frames[0].ndim == 2 else 0)
+
+            # Transpose to interleaved: (total_samples, channels)
+            if pcm_planar.ndim == 2:
+                pcm = pcm_planar.T
+            else:
+                pcm = pcm_planar.reshape(-1, 1)
+
+            # Trim to max duration
+            if len(pcm) > max_samples:
+                pcm = pcm[:max_samples]
 
             duration_s = len(pcm) / self._sample_rate
             logger.info(f"Audio decoded: {len(pcm)} samples, {channels}ch, "
@@ -99,42 +131,10 @@ class AudioDecodeWorker(QThread):
         except Exception as e:
             logger.error(f"Audio decode error: {e}", exc_info=True)
             self.error.emit(f"Decode error: {str(e)}")
-
-    def _probe_audio_info(self, ffmpeg: str) -> tuple:
-        """Probe audio channel count and channel_layout using ffprobe.
-        Returns (channels: int, channel_layout: str)."""
-        ffprobe = ffmpeg.replace("ffmpeg", "ffprobe")
-        if not shutil.which(ffprobe):
-            ffprobe = shutil.which("ffprobe")
-        if not ffprobe:
-            return 2, ""
-
-        channels = 2
-        channel_layout = ""
-
-        try:
-            cmd = [
-                ffprobe, "-v", "error",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=channels,channel_layout",
-                "-of", "csv=p=0",
-                self._file_path,
-            ]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                # Output format: "channels,channel_layout" e.g. "2,stereo" or "6,5.1(side)"
-                parts = result.stdout.strip().split(",", 1)
-                if parts[0].isdigit():
-                    channels = int(parts[0])
-                if len(parts) > 1:
-                    channel_layout = parts[1].strip()
-        except Exception:
-            pass
-
-        return channels, channel_layout
+            try:
+                container.close()
+            except Exception:
+                pass
 
     def stop(self):
         self._running = False
