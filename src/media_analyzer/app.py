@@ -1,7 +1,6 @@
 """Application setup and theme application."""
 
 import sys
-import platform
 from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle, QStyleOption
 from PySide6.QtGui import QPalette, QColor, QPainter, QPen, QPixmap, QIcon
 from PySide6.QtCore import Qt, QRect
@@ -71,7 +70,7 @@ def create_application(argv=None) -> QApplication:
     app.setStyle("Fusion")
 
     # On Windows: apply checkmark style for menu indicators (match macOS ✓)
-    if platform.system() == "Windows":
+    if sys.platform == "win32":
         app.setStyle(CheckmarkStyle("Fusion"))
 
     # Apply default theme
@@ -113,13 +112,15 @@ def _set_app_icon(app: QApplication) -> None:
         app.setWindowIcon(icon)
 
     # macOS: also set the Dock icon explicitly
-    import platform
-    if platform.system() == "Darwin":
+    if sys.platform == "darwin":
         _set_macos_dock_icon(icon_dir)
 
 
 def _set_macos_dock_icon(icon_dir: str) -> None:
     """Set macOS Dock icon using native API (pyobjc or ctypes fallback)."""
+    if sys.platform != "darwin":
+        return
+
     import os
 
     png_path = os.path.join(icon_dir, "app_icon_256.png")
