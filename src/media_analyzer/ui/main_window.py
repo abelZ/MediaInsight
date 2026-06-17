@@ -362,7 +362,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Media File",
             "",
-            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov *.webm *.mkv *.mka *.wav);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;WebM/MKV Files (*.webm *.mkv *.mka);;WAV Files (*.wav);;All Files (*)"
+            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov *.webm *.mkv *.mka *.wav *.aac);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;WebM/MKV Files (*.webm *.mkv *.mka);;WAV Files (*.wav);;AAC Files (*.aac);;All Files (*)"
         )
         if path:
             logger.info(f"Opening file: {path}")

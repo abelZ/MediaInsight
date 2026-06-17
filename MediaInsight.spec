@@ -90,6 +90,8 @@ hiddenimports = [
     'media_analyzer.parsers.ebml.elements',
     'media_analyzer.parsers.wav',
     'media_analyzer.parsers.wav.parser',
+    'media_analyzer.parsers.aac',
+    'media_analyzer.parsers.aac.parser',
     'media_analyzer.parsers.h264',
     'media_analyzer.parsers.h264.bitreader',
     'media_analyzer.parsers.h264.sps',

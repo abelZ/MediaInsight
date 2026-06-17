@@ -12,6 +12,7 @@ from media_analyzer.parsers.ts.parser import TSParser
 from media_analyzer.parsers.mp4.parser import MP4Parser
 from media_analyzer.parsers.ebml.parser import EBMLParser
 from media_analyzer.parsers.wav.parser import WAVParser
+from media_analyzer.parsers.aac.parser import AACParser
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,9 @@ class ParseWorker(QThread):
             elif WAVParser.sniff(header_peek):
                 self._parser = WAVParser()
                 logger.info("Detected format: WAV")
+            elif AACParser.sniff(header_peek):
+                self._parser = AACParser()
+                logger.info("Detected format: AAC (ADTS)")
             else:
                 logger.warning(f"Unsupported format (magic: {header_peek[:4].hex()})")
                 self.error.emit(f"Unsupported format (magic: {header_peek[:4].hex()})")

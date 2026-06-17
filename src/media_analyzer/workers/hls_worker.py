@@ -13,6 +13,7 @@ from media_analyzer.parsers.base import BaseParser
 from media_analyzer.parsers.flv.parser import FLVParser
 from media_analyzer.parsers.ts.parser import TSParser
 from media_analyzer.parsers.mp4.parser import MP4Parser
+from media_analyzer.parsers.aac.parser import AACParser
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ class HLSSegmentWorker(QThread):
             elif FLVParser.sniff(header_peek):
                 parser = FLVParser()
                 logger.debug("Segment format: FLV")
+            elif AACParser.sniff(header_peek):
+                parser = AACParser()
+                logger.debug("Segment format: AAC (ADTS)")
             else:
                 logger.warning(f"Unknown segment format (magic: {header_peek[:4].hex()})")
                 self.error.emit(
