@@ -173,6 +173,31 @@ Output: `dist/MediaInsight/MediaInsight.exe`
 
 VLC libraries from `vendor/vlc/win64/` are automatically bundled if present.
 
+#### VLC plugin cache (first-Play startup)
+
+`libvlc` scans every plugin DLL on first call to `vlc.Instance(...)` to discover demuxers, decoders, etc. With ~360 plugins (~150 MB), a cold scan takes **~4 s** — the user sees a multi-second freeze the first time they click Play. Subsequent Play clicks within the same process are instant because the plugins are already loaded.
+
+VLC supports a precomputed cache file (`plugins/plugins.dat`) that skips this scan. We ship one with the project to make first Play near-instant (~70 ms). Two things to know:
+
+1. **`plugins.dat` validates each entry by `(relative path, size, mtime)`.** Paths are relative to `plugins/`, so the cache is location-independent — zip → unzip → move → rename all work, **as long as mtimes are preserved**. Standard ZIP (Explorer, 7-Zip, `tar -a`) preserves them; plain `cp -r` and `git clone` do not.
+
+2. **PyInstaller stamps fresh mtimes on every copied DLL during `COLLECT`.** This invalidates the pre-built cache silently — VLC sees the mismatch, treats every entry as stale, and falls back to a full scan. So the bundled `dist/` build needs `plugins.dat` regenerated **after** PyInstaller finishes copying. `build_windows.bat` does this automatically by invoking `vendor\vlc\win64\vlc-cache-gen.exe` against `dist\MediaInsight\_internal\plugins\` after the PyInstaller step.
+
+If the build script reports `WARNING: plugin cache rebuild failed`, the bundle still works — just expect a ~4 s freeze on first Play.
+
+##### Regenerating `plugins.dat` for a new VLC version
+
+If you upgrade `vendor/vlc/win64/`, regenerate the cache once:
+
+```cmd
+cd vendor\vlc\win64
+vlc-cache-gen.exe "%CD%\plugins"
+```
+
+Important: `vlc-cache-gen.exe` only resolves plugins when given an **absolute Windows path**. A relative argument like `plugins` produces a 26-byte empty cache (header only, zero plugins) — which is silently accepted by VLC and gives no speedup at all.
+
+`vlc-cache-gen.exe` is shipped at `vendor/vlc/win64/vlc-cache-gen.exe` for the build script to use; it is a build-time tool only and is **not** included in the runtime distribution (the spec only bundles `libvlc.dll`, `libvlccore.dll`, and the `plugins/` folder).
+
 ### macOS
 
 ```bash

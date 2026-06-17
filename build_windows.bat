@@ -65,8 +65,25 @@ if exist dist\MediaInsight\MediaInsight.exe (
     echo Output: dist\MediaInsight\MediaInsight.exe
     echo.
     REM Show VLC status
-    if exist dist\MediaInsight\libvlc.dll (
+    if exist dist\MediaInsight\_internal\libvlc.dll (
         echo VLC: bundled ^(embedded player will work^)
+
+        REM Regenerate plugins.dat against the bundled plugin DLLs.
+        REM PyInstaller stamps fresh mtimes on the copied DLLs, which invalidates
+        REM the pre-shipped vendor cache and forces a ~4s plugin scan on first
+        REM Play. Rebuilding here makes first-Play instant.
+        if exist vendor\vlc\win64\vlc-cache-gen.exe (
+            echo Rebuilding VLC plugins.dat for bundled DLLs...
+            vendor\vlc\win64\vlc-cache-gen.exe "%CD%\dist\MediaInsight\_internal\plugins"
+            if exist dist\MediaInsight\_internal\plugins\plugins.dat (
+                echo VLC plugin cache: rebuilt
+            ) else (
+                echo WARNING: plugin cache rebuild failed; first Play will be slow
+            )
+        ) else (
+            echo NOTE: vendor\vlc\win64\vlc-cache-gen.exe missing; first Play will be slow
+            echo   Copy vlc-cache-gen.exe from your VLC install to vendor\vlc\win64\ once
+        )
     ) else (
         echo VLC: NOT bundled ^(player requires system VLC^)
     )
