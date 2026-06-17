@@ -78,6 +78,7 @@ class MainWindow(QMainWindow):
 
         # Navigation tab bar
         self._nav_bar = QTabBar()
+        self._nav_bar.setObjectName("navBar")
         self._nav_bar.addTab("Analyzer")
         self._nav_bar.addTab("Bitrate")
         self._nav_bar.addTab("Timestamp")

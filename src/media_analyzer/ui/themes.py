@@ -610,6 +610,36 @@ QTabBar::tab:selected {{
     border: 1px solid {theme.border_light};
 }}
 
+/* Top-level navigation bar — pill style with a bright selected chip */
+QTabBar#navBar {{
+    background-color: {theme.bg_primary};
+    border: none;
+    qproperty-drawBase: 0;
+}}
+QTabBar#navBar::tab {{
+    background-color: transparent;
+    color: {theme.fg_secondary};
+    padding: 8px 22px;
+    margin: 6px 4px;
+    border: none;
+    border-radius: 16px;
+    font-weight: 500;
+    min-height: 18px;
+}}
+QTabBar#navBar::tab:hover {{
+    background-color: {theme.hover_bg};
+    color: {theme.fg_primary};
+}}
+QTabBar#navBar::tab:selected {{
+    background-color: {theme.fg_accent};
+    color: #ffffff;
+    font-weight: 600;
+}}
+QTabBar#navBar::tab:selected:hover {{
+    background-color: {theme.fg_accent};
+    color: #ffffff;
+}}
+
 /* Tab Widget (Container Tabs) */
 QTabWidget::pane {{
     border: 1px solid {theme.border};
