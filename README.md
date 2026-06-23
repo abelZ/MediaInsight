@@ -17,6 +17,7 @@ Parses media containers at the **raw byte level** and displays packet/box/elemen
 | **MP4/MOV** | Tree (box hierarchy) | Full box parsing (60+ box types), mdat chunk/sample listing, avcC/hvcC/esds codec config decoding |
 | **WebM/MKV** | Tree (element hierarchy) | Full EBML element parsing, Cluster/Block decoding, VP8/VP9/AV1/H.264/H.265/Opus/Vorbis/AAC support |
 | **WAV** | Tree (chunk hierarchy) | RIFF chunk parsing, fmt/data/LIST/bext/fact/cue chunks, format details, byte-level hex highlighting |
+| **AAC (ADTS)** | Tree (frame list) | ADTS sync detection, per-frame header decode (profile/AOT, sample rate, channels, frame length, CRC), ID3v2 prefix skip, byte-level field highlighting |
 | **RTMP/RTMPS** | Dual tab (RTMP packets + FLV tags) | Pure Python protocol implementation, handshake capture, live stream analysis, Save As FLV |
 | **HLS/M3U8** | Segment list + analysis | M3U8 parsing, segment download, per-segment TS/fMP4 analysis, raw M3U8 text view |
 | **HTTP/HTTPS** | Auto-detect (FLV/TS/MP4) | Progressive download with progress display |
@@ -28,6 +29,7 @@ Parses media containers at the **raw byte level** and displays packet/box/elemen
 | **Analyzer** | Main analysis view — table/tree + detail panel + hex view |
 | **Bitrate** | Per-second video/audio bitrate chart with IDR markers |
 | **Timestamp** | Frame number vs. timestamp progression (detect jumps/drift) |
+| **GOP** | Per-frame size chart with GOP boundaries, I/P/B color coding, GOP statistics |
 | **Audio** | PCM waveform display + spectrogram (log/linear scale), multi-channel, playback with cursor sync |
 | **Player** | Built-in VLC-based media player + MediaInfo metadata |
 | **Log** | Real-time application log with level filtering and auto-scroll |
@@ -76,6 +78,17 @@ Parses media containers at the **raw byte level** and displays packet/box/elemen
 - Keyframe detection from SimpleBlock flags
 - Detail panel shows element definition, value, and contextual interpretation
 
+### AAC (ADTS) Analysis
+
+- Raw `.aac` ADTS streams parsed frame-by-frame
+- Optional ID3v2 prefix automatically skipped
+- 12-bit sync word detection with multi-frame chain validation (avoids false positives in foreign containers)
+- Per-frame header decoding: MPEG version, profile (AOT — Main/LC/SSR/LTP), sample rate (16-entry index table), channel configuration, frame length, buffer fullness, raw-data-block count, CRC presence
+- Synthetic HEADER row summarises detected stream parameters (`MPEG-x AAC-LC, 44100 Hz, Stereo`, etc.)
+- Per-frame timestamp computed from cumulative sample count (1024 × (num_raw_blocks + 1) samples per frame)
+- Byte-level hex highlight for every header field; HLS .aac segments also recognised
+- Audio page decodes via PyAV with manual ADTS fallback when the demuxer/decoder disagree on channel layout
+
 ### Bitrate Analysis
 
 - Frame-level bitrate calculation (not packet-level)
@@ -96,6 +109,15 @@ Parses media containers at the **raw byte level** and displays packet/box/elemen
 - Zoomable, double-click to reset
 - RTMP live mode support
 
+### GOP Analysis
+
+- Per-frame size chart with I/P/B color coding (I red, P blue, B green)
+- GOP boundaries derived from IDR positions
+- GOP statistics: count, min/avg/max GOP length, total frames
+- Supports FLV / RTMP / TS / MP4 / WebM/MKV via shared frame extraction
+- Filter to video frames only; horizontal scroll for long streams
+- RTMP live mode: chart updates as new GOPs arrive
+
 ### Analysis Capabilities
 
 - H.264 SPS/PPS full bitstream parsing (profile, level, resolution, chroma, etc.)
@@ -104,6 +126,7 @@ Parses media containers at the **raw byte level** and displays packet/box/elemen
 - Frame type identification: I/P/B via actual slice header parsing (not just random_access_indicator)
 - MP4 sample table cross-referencing (stco + stsc + stsz + stss)
 - AAC AudioSpecificConfig decoding (profile, sample rate, channels)
+- AAC ADTS frame header decoding (sync word, AOT, sample rate index, channel config, frame length, CRC)
 - EBML VInt parsing, element ID/size decoding, container recursion
 
 ## Installation
@@ -212,7 +235,7 @@ Output: `dist/MediaInsight.app`
 
 ### Open a File
 
-- **File → Open File** (Ctrl+O): Open a local media file (FLV, TS, MP4, MOV, WebM, MKV, WAV)
+- **File → Open File** (Ctrl+O): Open a local media file (FLV, TS, MP4, MOV, WebM, MKV, WAV, AAC)
 - **File → Open URL** (Ctrl+U): Open HTTP/HTTPS/RTMP/RTMPS/HLS(M3U8) stream
 
 ### Navigation
@@ -222,6 +245,7 @@ Output: `dist/MediaInsight.app`
 | Analyzer | — | Main analysis view (table/tree + detail + hex) |
 | Bitrate | — | Per-second bitrate chart with IDR markers |
 | Timestamp | — | Frame sequence vs timestamp chart |
+| GOP | — | Per-frame size chart with GOP boundaries and statistics |
 | Audio | — | PCM waveform + spectrogram, multi-channel playback |
 | Player | — | Video playback + MediaInfo display |
 | Log | — | Real-time application log |
@@ -274,6 +298,7 @@ src/media_analyzer/
 │   ├── mp4/             # MP4/MOV parser (box hierarchy, sample tables)
 │   ├── ebml/            # WebM/MKV parser (EBML elements, Cluster/Block decoding)
 │   ├── wav/             # WAV parser (RIFF chunks, fmt/data/LIST parsing)
+│   ├── aac/             # AAC ADTS parser (sync detection, per-frame header decode)
 │   ├── h264/            # H.264 bitstream (SPS/PPS, BitReader, exp-Golomb)
 │   └── h265/            # H.265 bitstream (VPS/SPS/PPS)
 ├── ui/
@@ -285,17 +310,18 @@ src/media_analyzer/
 │   ├── hls_view.py      # HLS segment list + raw M3U8 text view
 │   ├── bitrate_page.py  # Bitrate analysis chart (QtCharts)
 │   ├── timestamp_page.py # Timestamp progression chart (QtCharts)
-│   ├── audio_page.py    # Audio waveform + spectrogram (FFmpeg decode, sounddevice playback)
+│   ├── gop_page.py      # GOP page (frame-size chart + GOP statistics)
+│   ├── audio_page.py    # Audio waveform + spectrogram (PyAV decode, sounddevice playback)
 │   ├── log_page.py      # Real-time log view with filtering
 │   ├── detail_panel.py  # Field tree display (all formats)
 │   ├── hex_view.py      # Hex + ASCII split view
 │   ├── player_page.py   # VLC Player + MediaInfo page
 │   └── themes.py        # Color theme definitions
 └── workers/
-    ├── parse_worker.py  # Background parsing thread (FLV/TS/MP4/WebM/WAV)
+    ├── parse_worker.py  # Background parsing thread (FLV/TS/MP4/WebM/WAV/AAC)
     ├── rtmp_worker.py   # RTMP session worker thread
-    ├── hls_worker.py    # HLS segment download + parse worker
-    └── audio_decode_worker.py  # FFmpeg audio decode to PCM (background thread)
+    ├── hls_worker.py    # HLS segment download + parse worker (TS / fMP4 / AAC)
+    └── audio_decode_worker.py  # PyAV audio decode to PCM (background thread)
 ```
 
 ## Developer

@@ -38,9 +38,11 @@ class HLSSegmentWorker(QThread):
     parse_finished = Signal(object)    # StreamInfo
     error = Signal(str)
 
-    def __init__(self, segment_url: str, parent=None):
+    def __init__(self, segment_url: str, init_bytes: Optional[bytes] = None,
+                 parent=None):
         super().__init__(parent)
         self._url = segment_url
+        self._init_bytes = init_bytes
         self._running = True
         self._source: Optional[BufferSource] = None
 
@@ -57,9 +59,22 @@ class HLSSegmentWorker(QThread):
                 return
             logger.info(f"Segment downloaded: {len(data)} bytes")
 
-            # Step 2: Create in-memory source
+            # Step 2: For fMP4 segments, prepend the init segment so moov/codec
+            # config is available to the parser. We detect "looks like an ISO
+            # box" by checking bytes 4..8 — a TS file starts with 0x47, so this
+            # won't collide.
             filename = self._url.split("/")[-1].split("?")[0]
-            self._source = BufferSource(data, name=filename)
+            box_type = data[4:8] if len(data) >= 8 else b""
+            looks_like_iso = box_type in (b"styp", b"moof", b"ftyp",
+                                          b"moov", b"sidx", b"emsg")
+            if self._init_bytes and looks_like_iso:
+                buffer = self._init_bytes + data
+                logger.debug(f"Prepended {len(self._init_bytes)} init bytes "
+                             f"to {filename}")
+            else:
+                buffer = data
+
+            self._source = BufferSource(buffer, name=filename)
 
             # Step 3: Detect format and create parser
             reader = self._source.open()
@@ -67,7 +82,12 @@ class HLSSegmentWorker(QThread):
             reader.seek(0)
 
             parser: Optional[BaseParser] = None
-            if TSParser.sniff(header_peek):
+            # Prefer MP4 sniff when the leading bytes look like an ISO box —
+            # avoids the TS sniffer occasionally false-matching on a 0x47 byte.
+            if looks_like_iso and MP4Parser.sniff(header_peek):
+                parser = MP4Parser()
+                logger.debug("Segment format: MP4/fMP4")
+            elif TSParser.sniff(header_peek):
                 parser = TSParser()
                 logger.debug("Segment format: MPEG-TS")
             elif MP4Parser.sniff(header_peek):

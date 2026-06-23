@@ -18,6 +18,13 @@ class HLSSegment:
 
 
 @dataclass
+class HLSInitSegment:
+    """Initialization segment referenced by #EXT-X-MAP (CMAF/fMP4)."""
+    uri: str                                          # Absolute URL
+    byte_range: Optional[Tuple[int, int]] = None      # (length, offset)
+
+
+@dataclass
 class HLSPlaylist:
     """Parsed M3U8 playlist."""
     version: int = 1
@@ -28,6 +35,7 @@ class HLSPlaylist:
     segments: List[HLSSegment] = field(default_factory=list)
     total_duration: float = 0
     is_master: bool = False  # True if this is a master playlist
+    init_segment: Optional[HLSInitSegment] = None  # #EXT-X-MAP, for HLS-fMP4
 
 
 def parse_m3u8(content: str, base_url: str) -> HLSPlaylist:
@@ -89,6 +97,26 @@ def parse_m3u8(content: str, base_url: str) -> HLSPlaylist:
         elif line.startswith("#EXT-X-ENDLIST"):
             playlist.is_endlist = True
 
+        elif line.startswith("#EXT-X-MAP:"):
+            # Init segment for fMP4: #EXT-X-MAP:URI="init.mp4"[,BYTERANGE="<len>[@<off>]"]
+            attrs = _parse_attrs(line[len("#EXT-X-MAP:"):])
+            uri = attrs.get("URI")
+            if uri:
+                br = None
+                br_str = attrs.get("BYTERANGE")
+                if br_str:
+                    parts = br_str.split("@")
+                    try:
+                        length = int(parts[0])
+                        offset = int(parts[1]) if len(parts) > 1 else None
+                        br = (length, offset)
+                    except ValueError:
+                        br = None
+                playlist.init_segment = HLSInitSegment(
+                    uri=urljoin(base_url, uri),
+                    byte_range=br,
+                )
+
         elif line.startswith("#EXTINF:"):
             # Format: #EXTINF:<duration>[,<title>]
             info = line[8:]  # Skip "#EXTINF:"
@@ -137,3 +165,43 @@ def parse_m3u8(content: str, base_url: str) -> HLSPlaylist:
             current_byte_range = None
 
     return playlist
+
+
+def _parse_attrs(attrs_str: str) -> dict:
+    """Parse an HLS attribute list (KEY=VALUE pairs, comma-separated).
+
+    Values may be quoted ("...") in which case commas inside quotes are kept.
+    Quotes are stripped from the returned values.
+    """
+    out: dict = {}
+    i = 0
+    n = len(attrs_str)
+    while i < n:
+        # Skip leading commas / whitespace
+        while i < n and attrs_str[i] in ", \t":
+            i += 1
+        # Read key
+        key_start = i
+        while i < n and attrs_str[i] != "=":
+            i += 1
+        if i >= n:
+            break
+        key = attrs_str[key_start:i].strip()
+        i += 1  # skip '='
+        # Read value (quoted or bare)
+        if i < n and attrs_str[i] == '"':
+            i += 1
+            val_start = i
+            while i < n and attrs_str[i] != '"':
+                i += 1
+            value = attrs_str[val_start:i]
+            if i < n:
+                i += 1  # skip closing quote
+        else:
+            val_start = i
+            while i < n and attrs_str[i] != ",":
+                i += 1
+            value = attrs_str[val_start:i].strip()
+        if key:
+            out[key] = value
+    return out

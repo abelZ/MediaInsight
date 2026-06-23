@@ -75,6 +75,12 @@ BOX_DESCRIPTIONS = {
     "mvex": "Movie Extends",
     "trex": "Track Extends",
     "mehd": "Movie Extends Header",
+    "styp": "Segment Type",
+    "sidx": "Segment Index",
+    "prft": "Producer Reference Time",
+    "emsg": "Event Message",
+    "saio": "Sample Auxiliary Information Offsets",
+    "saiz": "Sample Auxiliary Information Sizes",
     "pssh": "Protection System Specific Header",
     "sinf": "Protection Scheme Info",
     "frma": "Original Format",
@@ -111,15 +117,25 @@ class MP4Parser(BaseParser):
         # Track sample tables for mdat sample listing
         self._tracks: List[Dict[str, Any]] = []  # Collected track info
         self._current_track: Optional[Dict[str, Any]] = None
+        # Fragmented MP4 (fMP4 / CMAF) state
+        self._tracks_by_id: Dict[int, Dict[str, Any]] = {}
+        self._trex_defaults: Dict[int, Dict[str, int]] = {}  # track_id -> defaults
+        self._current_moof_offset: int = 0
+        self._current_traf_track: Optional[Dict[str, Any]] = None
 
     @classmethod
     def sniff(cls, header_bytes: bytes) -> bool:
-        """Check if data looks like MP4/MOV (ftyp box at start, or other root boxes)."""
+        """Check if data looks like MP4/MOV (ftyp box at start, or other root boxes).
+
+        Also accepts fMP4 / CMAF segments which start with styp/moof, plus
+        sidx/emsg which may legally precede them.
+        """
         if len(header_bytes) < 8:
             return False
         box_type = header_bytes[4:8]
-        # Common first boxes in MP4/MOV files
-        if box_type in (b'ftyp', b'moov', b'free', b'wide', b'mdat', b'skip', b'pnot'):
+        # Common first boxes in MP4/MOV files (incl. fMP4 segments)
+        if box_type in (b'ftyp', b'moov', b'free', b'wide', b'mdat',
+                        b'skip', b'pnot', b'styp', b'moof', b'sidx', b'emsg'):
             return True
         # Also check for valid box size + known types at offset 0
         if len(header_bytes) >= 12:
@@ -135,6 +151,11 @@ class MP4Parser(BaseParser):
         """Yield one PacketInfo per MP4 box in depth-first order."""
         self._box_count = 0
         self._mdat_boxes: List[tuple] = []  # (offset, size, depth) for deferred mdat sample listing
+        # Reset per-call fragment state (but NOT _tracks / _tracks_by_id / _trex_defaults
+        # so that an init segment parsed earlier can prime codec config for a
+        # subsequent media-segment parse).
+        self._current_moof_offset = 0
+        self._current_traf_track = None
 
         # Get file size
         source.seek(0, 2)
@@ -143,6 +164,9 @@ class MP4Parser(BaseParser):
 
         # Parse root-level boxes
         yield from self._parse_boxes(source, 0, self._file_size, depth=0)
+
+        # Synthesize classic sample tables from any fragment_samples we accumulated
+        self._finalize_fragmented_tracks()
 
         # After all boxes parsed: emit mdat samples (handles mdat-before-moov case)
         if self._mdat_boxes and self._tracks:
@@ -244,7 +268,8 @@ class MP4Parser(BaseParser):
             yield packet
 
             # Track sample table state for mdat listing
-            self._track_sample_tables(source, box_type, pos + header_size, payload_size)
+            self._track_sample_tables(source, box_type, pos + header_size,
+                                      payload_size, pos)
 
             # Record mdat position for deferred sample listing
             if box_type == b'mdat':
@@ -315,6 +340,12 @@ class MP4Parser(BaseParser):
                 return self._parse_mfhd(data)
             elif box_type == b'trex':
                 return self._parse_trex(data)
+            elif box_type == b'styp':
+                return self._parse_styp(data, payload_size)
+            elif box_type == b'sidx':
+                return self._parse_sidx(data)
+            elif box_type == b'mehd':
+                return self._parse_mehd(data)
             elif box_type == b'avcC':
                 return self._parse_avcC(data)
             elif box_type == b'hvcC':
@@ -729,6 +760,77 @@ class MP4Parser(BaseParser):
             "default_sample_flags": struct.unpack(">I", data[20:24])[0],
         }
 
+    def _parse_styp(self, data: bytes, total_size: int) -> Dict[str, Any]:
+        """Parse Segment Type box — same shape as ftyp."""
+        return self._parse_ftyp(data, total_size)
+
+    def _parse_sidx(self, data: bytes) -> Dict[str, Any]:
+        """Parse Segment Index box (sidx)."""
+        if len(data) < 12:
+            return {}
+        version = data[0]
+        reference_id = struct.unpack(">I", data[4:8])[0]
+        timescale = struct.unpack(">I", data[8:12])[0]
+        pos = 12
+        if version == 0:
+            if pos + 8 > len(data):
+                return {"version": version, "reference_id": reference_id,
+                        "timescale": timescale}
+            earliest_pts = struct.unpack(">I", data[pos:pos+4])[0]
+            first_offset = struct.unpack(">I", data[pos+4:pos+8])[0]
+            pos += 8
+        else:
+            if pos + 16 > len(data):
+                return {"version": version, "reference_id": reference_id,
+                        "timescale": timescale}
+            earliest_pts = struct.unpack(">Q", data[pos:pos+8])[0]
+            first_offset = struct.unpack(">Q", data[pos+8:pos+16])[0]
+            pos += 16
+        # reserved(16) + reference_count(16)
+        if pos + 4 > len(data):
+            return {"version": version, "reference_id": reference_id,
+                    "timescale": timescale, "earliest_pts": earliest_pts,
+                    "first_offset": first_offset}
+        reference_count = struct.unpack(">H", data[pos+2:pos+4])[0]
+        pos += 4
+        refs = []
+        for _ in range(min(reference_count, 16)):
+            if pos + 12 > len(data):
+                break
+            r0 = struct.unpack(">I", data[pos:pos+4])[0]
+            r1 = struct.unpack(">I", data[pos+4:pos+8])[0]
+            r2 = struct.unpack(">I", data[pos+8:pos+12])[0]
+            refs.append({
+                "reference_type": (r0 >> 31) & 0x01,
+                "referenced_size": r0 & 0x7FFFFFFF,
+                "subsegment_duration": r1,
+                "starts_with_SAP": (r2 >> 31) & 0x01,
+                "SAP_type": (r2 >> 28) & 0x07,
+            })
+            pos += 12
+        return {
+            "version": version,
+            "reference_id": reference_id,
+            "timescale": timescale,
+            "earliest_presentation_time": earliest_pts,
+            "first_offset": first_offset,
+            "reference_count": reference_count,
+            "references": refs,
+        }
+
+    def _parse_mehd(self, data: bytes) -> Dict[str, Any]:
+        """Parse Movie Extends Header."""
+        if len(data) < 4:
+            return {}
+        version = data[0]
+        if version == 0 and len(data) >= 8:
+            fragment_duration = struct.unpack(">I", data[4:8])[0]
+        elif version == 1 and len(data) >= 12:
+            fragment_duration = struct.unpack(">Q", data[4:12])[0]
+        else:
+            return {"version": version}
+        return {"version": version, "fragment_duration": fragment_duration}
+
     # ------------------------------------------------------------------
     # Codec configuration box parsers
     # ------------------------------------------------------------------
@@ -1090,15 +1192,42 @@ class MP4Parser(BaseParser):
     # ------------------------------------------------------------------
 
     def _track_sample_tables(self, source: BinaryIO, box_type: bytes,
-                             payload_offset: int, payload_size: int) -> None:
-        """Collect sample table info during parsing for mdat listing."""
+                             payload_offset: int, payload_size: int,
+                             box_offset: int = 0) -> None:
+        """Collect sample table info during parsing for mdat listing.
+
+        box_offset is the absolute offset of this box in the source (needed by
+        moof for fragmented-MP4 base_data_offset resolution).
+        """
         if box_type == b'trak':
             # Start a new track
             self._current_track = {"handler": "", "stco": [], "stsz": [],
                                    "stsc": [], "stss": set(), "stts": [],
                                    "ctts": [], "timescale": 0,
-                                   "nalu_length_size": 4, "codec": ""}
+                                   "nalu_length_size": 4, "codec": "",
+                                   "track_id": 0,
+                                   "fragment_samples": [],
+                                   "next_dts": 0,
+                                   "traf_defaults": {}}
             self._tracks.append(self._current_track)
+        elif box_type == b'tkhd' and self._current_track is not None:
+            # Capture track_id so we can later look up the track for traf/tfhd
+            try:
+                source.seek(payload_offset)
+                hdr = source.read(min(payload_size, 32))
+                if len(hdr) >= 4:
+                    version = hdr[0]
+                    if version == 0 and len(hdr) >= 16:
+                        track_id = struct.unpack(">I", hdr[12:16])[0]
+                    elif version == 1 and len(hdr) >= 24:
+                        track_id = struct.unpack(">I", hdr[20:24])[0]
+                    else:
+                        track_id = 0
+                    if track_id:
+                        self._current_track["track_id"] = track_id
+                        self._tracks_by_id[track_id] = self._current_track
+            except (OSError, IOError, struct.error):
+                pass
         elif box_type == b'hdlr' and self._current_track is not None:
             # Only set handler if not already set (first hdlr in trak/mdia is correct,
             # ignore subsequent hdlr from udta/meta)
@@ -1236,6 +1365,261 @@ class MP4Parser(BaseParser):
             if len(raw) >= 22:
                 self._current_track["nalu_length_size"] = (raw[21] & 0x03) + 1
                 self._current_track["codec"] = "h265"
+        # --- Fragmented MP4 (fMP4 / CMAF) state ---
+        elif box_type == b'trex':
+            try:
+                source.seek(payload_offset)
+                raw = source.read(min(payload_size, 24))
+                if len(raw) >= 24:
+                    tid = struct.unpack(">I", raw[4:8])[0]
+                    self._trex_defaults[tid] = {
+                        "default_sample_duration": struct.unpack(">I", raw[12:16])[0],
+                        "default_sample_size": struct.unpack(">I", raw[16:20])[0],
+                        "default_sample_flags": struct.unpack(">I", raw[20:24])[0],
+                    }
+            except (OSError, IOError, struct.error):
+                pass
+        elif box_type == b'moof':
+            self._current_moof_offset = box_offset
+            self._current_traf_track = None
+        elif box_type == b'traf':
+            self._current_traf_track = None  # set by tfhd
+        elif box_type == b'tfhd':
+            self._handle_tfhd(source, payload_offset, payload_size)
+        elif box_type == b'tfdt':
+            self._handle_tfdt(source, payload_offset, payload_size)
+        elif box_type == b'trun':
+            self._handle_trun(source, payload_offset, payload_size)
+
+    # ------------------------------------------------------------------
+    # Fragmented MP4 handlers
+    # ------------------------------------------------------------------
+
+    def _handle_tfhd(self, source: BinaryIO,
+                     payload_offset: int, payload_size: int) -> None:
+        """Resolve the track for the current traf and capture per-traf defaults."""
+        try:
+            source.seek(payload_offset)
+            raw = source.read(min(payload_size, 32))
+        except (OSError, IOError):
+            return
+        if len(raw) < 8:
+            return
+        flags = (raw[1] << 16) | (raw[2] << 8) | raw[3]
+        track_id = struct.unpack(">I", raw[4:8])[0]
+        track = self._tracks_by_id.get(track_id)
+        if track is None:
+            # No prior trak (segment-only file): create a stub so trun has somewhere
+            # to attach. Codec config will be missing — frame-type analysis will fail
+            # gracefully, but charts still get bitrate/timestamp/GOP.
+            track = {"handler": "", "stco": [], "stsz": [],
+                     "stsc": [], "stss": set(), "stts": [],
+                     "ctts": [], "timescale": 0,
+                     "nalu_length_size": 4, "codec": "",
+                     "track_id": track_id,
+                     "fragment_samples": [],
+                     "next_dts": 0,
+                     "traf_defaults": {}}
+            self._tracks.append(track)
+            self._tracks_by_id[track_id] = track
+        self._current_traf_track = track
+
+        defaults: Dict[str, int] = {}
+        pos = 8
+        if flags & 0x000001 and pos + 8 <= len(raw):
+            defaults["base_data_offset"] = struct.unpack(">Q", raw[pos:pos+8])[0]
+            pos += 8
+        if flags & 0x000002 and pos + 4 <= len(raw):
+            pos += 4  # sample_description_index — not needed here
+        if flags & 0x000008 and pos + 4 <= len(raw):
+            defaults["default_sample_duration"] = struct.unpack(">I", raw[pos:pos+4])[0]
+            pos += 4
+        if flags & 0x000010 and pos + 4 <= len(raw):
+            defaults["default_sample_size"] = struct.unpack(">I", raw[pos:pos+4])[0]
+            pos += 4
+        if flags & 0x000020 and pos + 4 <= len(raw):
+            defaults["default_sample_flags"] = struct.unpack(">I", raw[pos:pos+4])[0]
+            pos += 4
+        defaults["default_base_is_moof"] = bool(flags & 0x020000)
+        defaults["base_data_offset_present"] = bool(flags & 0x000001)
+        track["traf_defaults"] = defaults
+
+    def _handle_tfdt(self, source: BinaryIO,
+                     payload_offset: int, payload_size: int) -> None:
+        """Reset current track's running DTS cursor to base_media_decode_time."""
+        track = self._current_traf_track
+        if track is None:
+            return
+        try:
+            source.seek(payload_offset)
+            raw = source.read(min(payload_size, 16))
+        except (OSError, IOError):
+            return
+        if len(raw) < 4:
+            return
+        version = raw[0]
+        if version == 0 and len(raw) >= 8:
+            track["next_dts"] = struct.unpack(">I", raw[4:8])[0]
+        elif version == 1 and len(raw) >= 12:
+            track["next_dts"] = struct.unpack(">Q", raw[4:12])[0]
+
+    def _handle_trun(self, source: BinaryIO,
+                     payload_offset: int, payload_size: int) -> None:
+        """Walk every sample in a trun and append to track['fragment_samples']."""
+        track = self._current_traf_track
+        if track is None or payload_size < 8:
+            return
+        try:
+            source.seek(payload_offset)
+            raw = source.read(payload_size)
+        except (OSError, IOError):
+            return
+        if len(raw) < 8:
+            return
+        version = raw[0]
+        flags = (raw[1] << 16) | (raw[2] << 8) | raw[3]
+        sample_count = struct.unpack(">I", raw[4:8])[0]
+        if sample_count == 0:
+            return
+
+        pos = 8
+        trun_data_offset = 0
+        first_sample_flags: Optional[int] = None
+        if flags & 0x000001 and pos + 4 <= len(raw):
+            trun_data_offset = struct.unpack(">i", raw[pos:pos+4])[0]
+            pos += 4
+        if flags & 0x000004 and pos + 4 <= len(raw):
+            first_sample_flags = struct.unpack(">I", raw[pos:pos+4])[0]
+            pos += 4
+
+        has_duration = bool(flags & 0x000100)
+        has_size = bool(flags & 0x000200)
+        has_flags = bool(flags & 0x000400)
+        has_cts = bool(flags & 0x000800)
+        entry_size = ((4 if has_duration else 0) + (4 if has_size else 0)
+                      + (4 if has_flags else 0) + (4 if has_cts else 0))
+        if entry_size == 0 and not (has_duration or has_size or has_flags or has_cts):
+            entry_size = 0  # all defaults — still emit samples
+
+        traf = track.get("traf_defaults", {}) or {}
+        trex = self._trex_defaults.get(track.get("track_id", 0), {}) or {}
+
+        # Resolve base_data_offset (anchor for absolute sample offsets in this traf)
+        if traf.get("base_data_offset_present"):
+            base = traf.get("base_data_offset", 0)
+        elif traf.get("default_base_is_moof"):
+            base = self._current_moof_offset
+        else:
+            # Spec default: end of last fragment of same track; the simplest viable
+            # approximation is the current moof offset — works for single-traf-per-moof
+            # CMAF segments (the overwhelmingly common case).
+            base = self._current_moof_offset
+        run_offset = base + trun_data_offset
+
+        default_duration = (traf.get("default_sample_duration")
+                            or trex.get("default_sample_duration") or 0)
+        default_size = (traf.get("default_sample_size")
+                        or trex.get("default_sample_size") or 0)
+        default_flags = (traf.get("default_sample_flags")
+                         or trex.get("default_sample_flags") or 0)
+
+        cur_offset = run_offset
+        for i in range(sample_count):
+            duration = default_duration
+            size = default_size
+            sflags = default_flags
+            cts_offset = 0
+
+            if entry_size > 0 and pos + entry_size > len(raw):
+                break
+
+            if has_duration:
+                duration = struct.unpack(">I", raw[pos:pos+4])[0]
+                pos += 4
+            if has_size:
+                size = struct.unpack(">I", raw[pos:pos+4])[0]
+                pos += 4
+            if has_flags:
+                sflags = struct.unpack(">I", raw[pos:pos+4])[0]
+                pos += 4
+            elif i == 0 and first_sample_flags is not None:
+                sflags = first_sample_flags
+            if has_cts:
+                if version == 0:
+                    cts_offset = struct.unpack(">I", raw[pos:pos+4])[0]
+                else:
+                    cts_offset = struct.unpack(">i", raw[pos:pos+4])[0]
+                pos += 4
+
+            # sample_is_non_sync_sample is bit 16 of the sample flags field
+            is_sync = ((sflags >> 16) & 0x01) == 0
+            dts = track.get("next_dts", 0)
+            track["fragment_samples"].append(
+                (cur_offset, size, dts, cts_offset, is_sync, duration))
+            track["next_dts"] = dts + duration
+            cur_offset += size
+
+    def _finalize_fragmented_tracks(self) -> None:
+        """Synthesize classic stts/stsz/stss/ctts/stco/stsc tables from trun data.
+
+        Only fills a track's tables when the classic ones are empty, so a
+        regular MP4 (with real stco/stsz/etc.) is never overwritten.
+        """
+        for track in self._tracks:
+            samples = track.get("fragment_samples") or []
+            if not samples:
+                continue
+            if track.get("stsz") or track.get("stco"):
+                # Hybrid file with both moov.trak.stbl tables AND a moof — keep classic.
+                continue
+
+            sizes: List[int] = []
+            sync: set = set()
+            stco: List[int] = []
+            durations: List[int] = []
+            cts: List[int] = []
+            for idx, (off, size, _dts, cts_off, is_sync, dur) in enumerate(samples):
+                sizes.append(size)
+                stco.append(off)
+                durations.append(dur)
+                cts.append(cts_off)
+                if is_sync:
+                    sync.add(idx + 1)
+
+            # Run-length compress durations into stts entries
+            stts: List[tuple] = []
+            if durations:
+                run_count = 1
+                cur = durations[0]
+                for d in durations[1:]:
+                    if d == cur:
+                        run_count += 1
+                    else:
+                        stts.append((run_count, cur))
+                        cur = d
+                        run_count = 1
+                stts.append((run_count, cur))
+
+            ctts: List[tuple] = []
+            if any(c != 0 for c in cts):
+                run_count = 1
+                cur_c = cts[0]
+                for c in cts[1:]:
+                    if c == cur_c:
+                        run_count += 1
+                    else:
+                        ctts.append((run_count, cur_c))
+                        cur_c = c
+                        run_count = 1
+                ctts.append((run_count, cur_c))
+
+            track["stsz"] = sizes
+            track["stss"] = sync
+            track["stco"] = stco
+            track["stsc"] = [(1, 1)]
+            track["stts"] = stts
+            if ctts:
+                track["ctts"] = ctts
 
     def _analyze_frame_types(self, source: BinaryIO) -> None:
         """Analyze frame types and reference relationships for video tracks.
@@ -1612,6 +1996,25 @@ class MP4Parser(BaseParser):
         if self._timescale > 0 and self._duration > 0:
             duration_ms = int(self._duration * 1000 / self._timescale)
 
+        # Detect fragmented content: any track that received trun-derived samples.
+        is_fragmented = any(track.get("fragment_samples") for track in self._tracks)
+
+        # If we have fragmented data but mvhd didn't give us a duration, derive
+        # one from the longest video/audio track's synthesized stts.
+        if duration_ms == 0 and is_fragmented:
+            best_ms = 0
+            for track in self._tracks:
+                ts = track.get("timescale", 0)
+                if ts <= 0:
+                    continue
+                total = sum(count * delta for count, delta in track.get("stts", []))
+                if total <= 0:
+                    continue
+                ms = int(total * 1000 / ts)
+                if ms > best_ms:
+                    best_ms = ms
+            duration_ms = best_ms
+
         # Store tracks data for bitrate analysis
         tracks_for_bitrate = []
         for track in self._tracks:
@@ -1630,7 +2033,7 @@ class MP4Parser(BaseParser):
 
         return StreamInfo(
             source_path="",
-            format_name="MP4/MOV",
+            format_name="fMP4 (CMAF)" if is_fragmented else "MP4/MOV",
             duration_ms=duration_ms,
             total_tags=self._box_count,
             file_size=self._file_size,

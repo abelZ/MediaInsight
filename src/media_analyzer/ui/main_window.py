@@ -27,7 +27,7 @@ class MainWindow(QMainWindow):
     Main application window.
 
     Menu Bar:
-      File: Open File, Open URL, Stop, Exit
+      File: Open File, Open URL, Close, Stop, Exit
       Filter: Show Video, Show Audio, Show Script
     """
 
@@ -55,6 +55,8 @@ class MainWindow(QMainWindow):
         self._rtmp_view = None  # RTMPDualView widget (created on demand)
         self._hls_view = None  # HLS segment list view (created on demand)
         self._hls_mediainfo_path: Optional[str] = None  # Cached first segment for MediaInfo
+        self._hls_init_bytes: Optional[bytes] = None  # HLS-fMP4 init segment cache
+        self._hls_init_uri: Optional[str] = None
         self._current_file_path: Optional[str] = None  # Current file path for player page
         self._all_packets: List[PacketInfo] = []  # All packets for bitrate analysis (all formats)
 
@@ -67,6 +69,12 @@ class MainWindow(QMainWindow):
     def _setup_models(self):
         """Initialize data models."""
         self._table_model = PacketTableModel(self)
+        # Hidden parent used to park detached widgets (e.g. _table_view when a
+        # tree/TS-tabs view temporarily replaces it). Reparenting a visible
+        # widget to None briefly promotes it to a top-level window — visible
+        # as a flash — so we park it inside this never-shown widget instead.
+        self._widget_stash = QWidget()
+        self._widget_stash.setVisible(False)
 
     def _setup_ui(self):
         """Build the main UI layout with navigation bar and stacked pages."""
@@ -184,6 +192,14 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        self._close_action = QAction("Close", self)
+        self._close_action.setShortcut(QKeySequence("Ctrl+W"))
+        self._close_action.triggered.connect(self._close_current)
+        self._close_action.setEnabled(False)
+        file_menu.addAction(self._close_action)
+
+        file_menu.addSeparator()
+
         self._save_as_action = QAction("Save As...", self)
         self._save_as_action.setShortcut(QKeySequence("Ctrl+S"))
         self._save_as_action.triggered.connect(self._save_as)
@@ -280,12 +296,14 @@ class MainWindow(QMainWindow):
             "<li>MP4/MOV (ISO BMFF)</li>"
             "<li>WebM/MKV (Matroska / EBML)</li>"
             "<li>WAV (RIFF/WAVE)</li>"
+            "<li>AAC (ADTS)</li>"
             "<li>RTMP / RTMPS (Live Stream)</li>"
             "<li>HLS / M3U8 (HTTP Live Streaming)</li>"
             "<li>HTTP/HTTPS progressive download</li>"
             "</ul>"
             "<p><b>Analysis:</b> Packet/Box/Element hierarchy, NALU parsing, "
-            "Bitrate chart, Timestamp chart, Audio waveform &amp; spectrogram, "
+            "Bitrate chart, Timestamp chart, GOP chart, "
+            "Audio waveform &amp; spectrogram, "
             "Video playback, MediaInfo</p>"
             "<p><b>Log:</b> Real-time application log with level filtering</p>"
             "<hr>"
@@ -363,14 +381,23 @@ class MainWindow(QMainWindow):
             self,
             "Open Media File",
             "",
-            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov *.webm *.mkv *.mka *.wav *.aac);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;WebM/MKV Files (*.webm *.mkv *.mka);;WAV Files (*.wav);;AAC Files (*.aac);;All Files (*)"
+            "Media Files (*.flv *.ts *.m2ts *.mp4 *.m4a *.m4v *.mov *.webm *.mkv *.mka *.wav *.aac *.m3u8 *.m3u);;FLV Files (*.flv);;TS Files (*.ts *.m2ts);;MP4 Files (*.mp4 *.m4a *.m4v *.mov);;WebM/MKV Files (*.webm *.mkv *.mka);;WAV Files (*.wav);;AAC Files (*.aac);;HLS Playlists (*.m3u8 *.m3u);;All Files (*)"
         )
         if path:
             logger.info(f"Opening file: {path}")
             self._current_file_path = path
             self._reset_player_on_new_file()
-            source = FileSource(path)
-            self._start_parsing(source)
+            # Local .m3u8 → route through the HLS pipeline. urllib supports
+            # file:// natively, so we convert the path to a URL and let the
+            # existing flow handle download + segment resolution.
+            if path.lower().endswith((".m3u8", ".m3u")):
+                from pathlib import Path
+                file_url = Path(path).resolve().as_uri()
+                self._start_hls(file_url)
+            else:
+                source = FileSource(path)
+                self._start_parsing(source)
+            self._close_action.setEnabled(True)
 
     def _open_url(self):
         """Open a network stream URL."""
@@ -394,6 +421,63 @@ class MainWindow(QMainWindow):
             else:
                 source = StreamingHTTPSource(url)
                 self._start_parsing(source)
+            self._close_action.setEnabled(True)
+
+    def _close_current(self):
+        """Close the currently opened file/URL and reset all views."""
+        logger.info(f"Closing: {self._current_file_path}")
+
+        # Stop any active workers. Drop the reference BEFORE waiting so any
+        # queued packets_ready emissions that fire while we wait will see a
+        # mismatch in the slot's worker-identity check and bail out.
+        if self._worker is not None:
+            stale = self._worker
+            self._worker = None
+            if stale.isRunning():
+                stale.stop()
+                stale.wait(3000)
+            if stale.source:
+                stale.source.close()
+
+        # Stop RTMP / HLS
+        self._stop_rtmp()
+        self._rtmp_control_bar.hide()
+        self._swap_from_rtmp_view()
+        self._swap_from_hls_view()
+
+        # Stop HLS segment worker if any
+        if hasattr(self, '_hls_segment_worker') and self._hls_segment_worker:
+            self._hls_segment_worker.stop()
+            self._hls_segment_worker.wait(3000)
+            self._hls_segment_worker = None
+        self._hls_mediainfo_path = None
+
+        # Reset player/analysis pages (stops playback, clears charts)
+        self._reset_player_on_new_file()
+
+        # Clear data buffers
+        self._table_model.clear()
+        self._all_packets.clear()
+        self._detail_panel.clear()
+        self._hex_view.clear()
+        self._stream_info = None
+        self._current_packet = None
+        self._current_pes_data = None
+        self._format_detected = False
+        self._current_file_path = None
+
+        # Restore default table view layout
+        self._swap_from_ts_tabbed_view()
+        self._swap_to_table_view()
+
+        # Reset UI state
+        self._progress_bar.hide()
+        self._stop_action.setEnabled(False)
+        self._save_as_action.setEnabled(False)
+        self._close_action.setEnabled(False)
+        self._info_label.setText("")
+        self._status_label.setText("Ready - Open a file or URL to begin analysis")
+        self.setWindowTitle("MediaInsight")
 
     def _save_as(self):
         """Save downloaded stream content to a local file."""
@@ -636,6 +720,10 @@ class MainWindow(QMainWindow):
         self._detail_panel.clear()
         self._hex_view.clear()
 
+        # Reset init-segment state from any previous HLS session
+        self._hls_init_bytes = None
+        self._hls_init_uri = None
+
         self._status_label.setText(f"Downloading M3U8: {url}")
 
         try:
@@ -677,41 +765,97 @@ class MainWindow(QMainWindow):
             f"Total: {playlist.total_duration:.1f}s")
         self.setWindowTitle(f"MediaInsight - {url.split('/')[-1].split('?')[0]}")
 
+        # Eagerly fetch the EXT-X-MAP init segment (HLS-fMP4 / CMAF). The init
+        # contains ftyp/moov/mvex; every media .m4s segment depends on it for
+        # codec config, timescale, and trex defaults.
+        if playlist.init_segment is not None:
+            self._hls_init_uri = playlist.init_segment.uri
+            try:
+                br = playlist.init_segment.byte_range
+                init_req = urllib.request.Request(playlist.init_segment.uri)
+                init_req.add_header("User-Agent", "MediaInsight/1.0")
+                if br and not playlist.init_segment.uri.startswith("file:"):
+                    # HTTP byte-range request
+                    length, offset = br
+                    start = offset if offset is not None else 0
+                    init_req.add_header("Range", f"bytes={start}-{start + length - 1}")
+                init_resp = urllib.request.urlopen(init_req, timeout=15)
+                self._hls_init_bytes = init_resp.read()
+                init_resp.close()
+                # file:// URLs ignore the Range header — slice locally so the
+                # behavior matches HTTP exactly.
+                if br and playlist.init_segment.uri.startswith("file:"):
+                    length, offset = br
+                    start = offset if offset is not None else 0
+                    self._hls_init_bytes = self._hls_init_bytes[start:start + length]
+                logger.info(f"HLS init segment loaded: "
+                            f"{len(self._hls_init_bytes)} bytes from "
+                            f"{playlist.init_segment.uri}")
+            except Exception as e:
+                self._hls_init_bytes = None
+                logger.warning(f"Failed to fetch HLS init segment: {e}")
+            self._hls_view.set_init_status(self._hls_init_bytes is not None)
+
     def _on_hls_segment_clicked(self, segment):
         """Handle HLS segment click — download and parse."""
         from media_analyzer.workers.hls_worker import HLSSegmentWorker
 
-        # Stop any running segment worker
+        # Stop any running segment worker. Drop the reference BEFORE waiting
+        # so any queued packets_ready emissions hit the slot's identity check
+        # and are dropped instead of contaminating the next segment's tree.
         if hasattr(self, '_hls_segment_worker') and self._hls_segment_worker:
-            self._hls_segment_worker.stop()
-            self._hls_segment_worker.wait(3000)
+            stale = self._hls_segment_worker
+            self._hls_segment_worker = None
+            if self._worker is stale:
+                self._worker = None
+            stale.stop()
+            stale.wait(3000)
 
         # Mark as downloading
         self._hls_view.set_segment_status(segment.index, "downloading")
 
-        # Clear previous segment data (but keep HLS layout intact)
+        # Clear previous segment data (but keep widgets intact). Format
+        # detection on the new segment's first packet decides whether to:
+        #   (a) reuse the existing middle widget (same format) — just clears it
+        #   (b) atomically swap via QSplitter.replaceWidget (different format)
+        # We MUST NOT destroy the old middle widget here — doing so would
+        # leave the splitter in a transient 2-pane state, which Qt reflows
+        # immediately (HLSView and right_splitter stretch into the gap and
+        # render at least one frame at the new geometry — that's the flash).
         self._table_model.clear()
         self._all_packets.clear()
         self._detail_panel.clear()
         self._hex_view.clear()
         self._format_detected = False
 
-        # Start download + parse
-        self._hls_segment_worker = HLSSegmentWorker(segment.uri, self)
-        self._hls_segment_worker.packets_ready.connect(self._on_packets_ready)
-        self._hls_segment_worker.progress.connect(self._on_progress)
-        self._hls_segment_worker.parse_finished.connect(
-            lambda si: self._on_hls_segment_parsed(si, segment.index))
-        self._hls_segment_worker.error.connect(
-            lambda err: self._on_hls_segment_error(err, segment.index))
-        self._hls_segment_worker.start()
+        # Start download + parse. Bind the worker into each slot via a lambda
+        # so the slot can verify it was invoked by the currently-active worker
+        # (queued emissions from a stopped worker can fire after we've cleared
+        # state for the next segment).
+        worker = HLSSegmentWorker(
+            segment.uri,
+            init_bytes=getattr(self, "_hls_init_bytes", None),
+            parent=self,
+        )
+        self._hls_segment_worker = worker
+        # Tracked as the active worker for hex view access AND for the
+        # slot identity check.
+        self._worker = worker
+        worker.packets_ready.connect(
+            lambda packets, w=worker: self._on_packets_ready(packets, w))
+        worker.progress.connect(
+            lambda cur, tot, w=worker: self._on_progress(cur, tot, w))
+        worker.parse_finished.connect(
+            lambda si, w=worker, idx=segment.index:
+                self._on_hls_segment_parsed(si, idx) if w is self._worker else None)
+        worker.error.connect(
+            lambda err, w=worker, idx=segment.index:
+                self._on_hls_segment_error(err, idx) if w is self._worker else None)
+        worker.start()
 
         self._progress_bar.setValue(0)
         self._progress_bar.show()
         self._status_label.setText(f"Downloading segment #{segment.index}...")
-
-        # Store worker as current for hex view access
-        self._worker = self._hls_segment_worker
 
     def _on_hls_segment_parsed(self, stream_info, segment_index: int):
         """Handle HLS segment parse completion."""
@@ -719,13 +863,27 @@ class MainWindow(QMainWindow):
         self._progress_bar.hide()
         self._hls_view.set_segment_status(segment_index, "loaded")
 
-        # Cache first segment as temp file for MediaInfo
+        # Cache the first successfully-parsed segment to a temp file so the
+        # Player tab's MediaInfo can read it. For HLS+fMP4 the BufferSource
+        # already contains `init_bytes + segment_bytes` (the worker prepends
+        # the EXT-X-MAP init), so the merged buffer is a complete fragmented
+        # MP4 — MediaInfo identifies it as MPEG-4 and extracts codec, duration,
+        # bitrate from the moov + trun-derived sample data.
         if not hasattr(self, '_hls_mediainfo_path') or self._hls_mediainfo_path is None:
             if hasattr(self, '_hls_segment_worker') and self._hls_segment_worker:
                 source = self._hls_segment_worker.source
                 if source and source.size > 0:
                     import tempfile, os
-                    ext = os.path.splitext(source.name)[1] or ".ts"
+                    src_ext = os.path.splitext(source.name)[1].lower()
+                    # Normalize extension so MediaInfo and external tools
+                    # recognise the file: fMP4 segments (.m4s / .mp4 / .cmfv /
+                    # .cmfa) → .mp4; TS / other → keep original (default .ts).
+                    if src_ext in (".m4s", ".cmfv", ".cmfa", ".mp4", ".m4a", ".m4v"):
+                        ext = ".mp4"
+                    elif src_ext:
+                        ext = src_ext
+                    else:
+                        ext = ".ts"
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=ext, delete=False, prefix="mediainsight_hls_")
                     reader = source.open()
@@ -733,6 +891,8 @@ class MainWindow(QMainWindow):
                     tmp.write(reader.read())
                     tmp.close()
                     self._hls_mediainfo_path = tmp.name
+                    logger.info(f"HLS MediaInfo cache: {tmp.name} "
+                                f"({source.size} bytes, format={stream_info.format_name})")
 
         count = self._table_model.packet_count
         self._status_label.setText(
@@ -804,6 +964,9 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
             self._hls_mediainfo_path = None
+        # Drop cached init segment so a future HLS session starts clean
+        self._hls_init_bytes = None
+        self._hls_init_uri = None
         # Restore splitter to 2 widgets: [table_view, right_splitter]
         self._table_view.show()
         self._main_splitter.setSizes([800, 450])
@@ -876,10 +1039,20 @@ class MainWindow(QMainWindow):
             # Pass URL/path + source for MediaInfo temp file fallback
             if self._player_page and self._current_file_path:
                 source = self._worker.source if self._worker else None
-                # For RTMP: generate temp FLV for MediaInfo
+                # For RTMP / HLS: generate or fetch the temp file for MediaInfo
                 mediainfo_path = self._get_mediainfo_path()
+                # In HLS mode the playback URL doesn't change between segment
+                # clicks, so player_page's identity-based early-return would
+                # skip a MediaInfo refresh even when the cache was just
+                # populated. Force-reload when we have an HLS cache path.
+                force_mediainfo = (
+                    hasattr(self, '_hls_view') and self._hls_view is not None
+                    and mediainfo_path is not None
+                )
                 self._player_page.load_file(
-                    self._current_file_path, mediainfo_path=mediainfo_path)
+                    self._current_file_path,
+                    mediainfo_path=mediainfo_path,
+                    force_mediainfo_reload=force_mediainfo)
         self._pages.setCurrentIndex(index)
 
     def _get_mediainfo_path(self) -> Optional[str]:
@@ -888,13 +1061,19 @@ class MainWindow(QMainWindow):
         if not path:
             return None
 
+        # HLS session active (regardless of whether the .m3u8 is local or
+        # remote): MediaInfo can't read the playlist, only a downloaded
+        # segment. Use the cache populated by _on_hls_segment_parsed —
+        # for HLS+fMP4 the cache contains init+segment merged into a valid
+        # fragmented MP4; for HLS+TS it contains the first downloaded TS.
+        if hasattr(self, '_hls_view') and self._hls_view is not None:
+            if hasattr(self, '_hls_mediainfo_path') and self._hls_mediainfo_path:
+                return self._hls_mediainfo_path
+            return None  # cache not populated yet — segment hasn't been clicked
+
         # Local file: use directly
         if not path.startswith("http") and not path.startswith("rtmp"):
             return path
-
-        # HLS: use cached first segment
-        if hasattr(self, '_hls_mediainfo_path') and self._hls_mediainfo_path:
-            return self._hls_mediainfo_path
 
         # HTTP stream with downloaded data: save to temp file
         if self._worker:
@@ -1068,12 +1247,19 @@ class MainWindow(QMainWindow):
     # --- View Switching ---
 
     def _swap_to_ts_tabbed_view(self):
-        """Replace left panel with a tabbed TS view (Packet View + PES View)."""
+        """Replace centre/left panel with a tabbed TS view (Packet + PES).
+
+        In HLS mode the TS tabs go at splitter index 1 (between hls_view and
+        right_splitter); otherwise at index 0.
+        """
         from PySide6.QtWidgets import QTabWidget
         from media_analyzer.ui.packet_table.model import TS_PKT_COLUMNS
 
         if hasattr(self, '_ts_tabs') and self._ts_tabs is not None:
             return  # Already in TS tabbed mode
+
+        in_hls = hasattr(self, '_hls_view') and self._hls_view is not None
+        target_index = 1 if in_hls else 0
 
         self._ts_tabs = QTabWidget()
         self._ts_tabs.setTabPosition(QTabWidget.TabPosition.South)
@@ -1095,16 +1281,20 @@ class MainWindow(QMainWindow):
         self._ts_pes_view.packet_selected.connect(self._on_packet_selected)
         self._ts_tabs.addTab(self._ts_pes_view, "PES View")
 
-        # Hide default table, show TS tabs
-        self._table_view.hide()
-        self._main_splitter.insertWidget(0, self._ts_tabs)
-        self._main_splitter.setSizes([800, 0, 450])
+        # Atomic swap (see _swap_to_box_tree_view for the rationale).
+        old = self._main_splitter.replaceWidget(target_index, self._ts_tabs)
+        if old is not None:
+            self._adopt_into_stash(old)
+        if in_hls:
+            self._main_splitter.setSizes([300, 500, 450])
+        else:
+            self._main_splitter.setSizes([800, 450])
 
     def _swap_from_ts_tabbed_view(self):
         """Remove TS tabbed view and restore normal table."""
         if hasattr(self, '_ts_tabs') and self._ts_tabs is not None:
             self._ts_tabs.hide()
-            self._ts_tabs.setParent(None)
+            self._ts_tabs.setParent(self._widget_stash)
             self._ts_tabs.deleteLater()
             self._ts_tabs = None
             self._ts_pkt_model = None
@@ -1119,45 +1309,101 @@ class MainWindow(QMainWindow):
         return False
 
     def _swap_to_box_tree_view(self, with_frame_view: bool = True):
-        """Replace the left panel with tree view (+ optional Frame tab)."""
+        """Replace the centre/left panel with tree view (+ optional Frame tab).
+
+        Uses QSplitter.replaceWidget so the splitter never transitions through
+        a 2-pane state — that state would let HLSView and right_splitter
+        stretch into the freed width and render at least one frame at the new
+        geometry, which the user sees as a flash.
+
+        In HLS mode the splitter is [hls_view, ?, right_splitter] and we
+        replace the middle widget at index 1. Otherwise it's [?, right_splitter]
+        and the tree goes at index 0.
+        """
         from PySide6.QtWidgets import QTabWidget
         from media_analyzer.ui.box_tree_view import BoxTreeView
 
-        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
-            return  # Already in box/frame mode
+        in_hls = hasattr(self, '_hls_view') and self._hls_view is not None
+        target_index = 1 if in_hls else 0
 
+        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            # Already in box/frame mode — same-format reuse. Just clear data;
+            # no splitter mutation, no widget churn, no flash.
+            self._box_tree_view.clear()
+            if hasattr(self, '_frame_model') and self._frame_model is not None:
+                self._frame_model.clear()
+            return
+
+        # Build the new middle widget (container_tabs or box_tree_view alone)
         self._box_tree_view = BoxTreeView()
         self._box_tree_view.box_selected.connect(self._on_packet_selected)
 
         if with_frame_view:
-            # Tabbed container: Tree View + Frame View
             self._container_tabs = QTabWidget()
             self._container_tabs.setTabPosition(QTabWidget.TabPosition.South)
             self._container_tabs.addTab(self._box_tree_view, "Tree View")
-
             self._frame_model = PacketTableModel(self)
             self._frame_model.set_column_mode("frame")
             self._frame_view = PacketTableView(self._frame_model)
             self._frame_view.packet_selected.connect(self._on_packet_selected)
             self._container_tabs.addTab(self._frame_view, "Frame View")
-
             self._container_tabs.currentChanged.connect(self._on_container_tab_changed)
-
-            self._table_view.hide()
-            self._main_splitter.insertWidget(0, self._container_tabs)
+            new_widget = self._container_tabs
         else:
-            # Tree-only mode (e.g. WAV — no frame concept)
-            self._table_view.hide()
-            self._main_splitter.insertWidget(0, self._box_tree_view)
+            new_widget = self._box_tree_view
 
-        self._main_splitter.setSizes([800, 0, 450])
+        # Atomic swap: replaceWidget is synchronous and keeps the splitter at
+        # the same child count. The displaced widget is returned with
+        # parent=None / isWindow=True — we re-parent to the hidden stash
+        # immediately, before the event loop runs, so it never becomes a
+        # visible top-level window.
+        old = self._main_splitter.replaceWidget(target_index, new_widget)
+        if old is not None:
+            self._adopt_into_stash(old)
+
+        if in_hls:
+            self._main_splitter.setSizes([300, 500, 450])
+        else:
+            self._main_splitter.setSizes([800, 450])
+
+    def _adopt_into_stash(self, widget) -> None:
+        """Defuse a widget that QSplitter.replaceWidget just detached.
+
+        `replaceWidget` returns the old widget with `parent=None` and
+        `isWindow=True` — Qt is one paint cycle away from briefly rendering
+        it as a freestanding top-level window. Re-parent it into the hidden
+        stash synchronously (no event-loop turn in between) so that never
+        happens. `_table_view` is a persistent member; we only hide+stash it.
+        Other widgets (_ts_tabs / _container_tabs / standalone _box_tree_view)
+        are owned by this swap cycle and get deleteLater().
+        """
+        widget.hide()
+        widget.setParent(self._widget_stash)
+        if widget is self._table_view:
+            return  # keep alive — it will be reused later
+        widget.deleteLater()
+        # Clear instance attributes that pointed to this widget so swap
+        # functions don't think the old view is still active.
+        if widget is getattr(self, '_ts_tabs', None):
+            self._ts_tabs = None
+            self._ts_pkt_model = None
+            self._ts_pkt_view = None
+            self._ts_pes_model = None
+            self._ts_pes_view = None
+        elif widget is getattr(self, '_container_tabs', None):
+            self._container_tabs = None
+            self._box_tree_view = None
+            self._frame_model = None
+            self._frame_view = None
+        elif widget is getattr(self, '_box_tree_view', None):
+            self._box_tree_view = None
 
     def _swap_to_table_view(self):
         """Restore the table view (when switching from any special mode)."""
         # Clean up MP4/WebM container tabs
         if hasattr(self, '_container_tabs') and self._container_tabs is not None:
             self._container_tabs.hide()
-            self._container_tabs.setParent(None)
+            self._container_tabs.setParent(self._widget_stash)
             self._container_tabs.deleteLater()
             self._container_tabs = None
             self._box_tree_view = None
@@ -1165,14 +1411,43 @@ class MainWindow(QMainWindow):
             self._frame_view = None
         elif hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
             self._box_tree_view.hide()
-            self._box_tree_view.setParent(None)
+            self._box_tree_view.setParent(self._widget_stash)
             self._box_tree_view.deleteLater()
             self._box_tree_view = None
         # Clean up TS tabs
         self._swap_from_ts_tabbed_view()
+        # Re-attach the default table at index 0 if it was parked in the stash
+        if self._main_splitter.indexOf(self._table_view) == -1:
+            self._main_splitter.insertWidget(0, self._table_view)
         self._table_view.show()
         # Restore splitter proportions
         self._main_splitter.setSizes([800, 450])
+
+    def _teardown_segment_views(self):
+        """Tear down per-segment special views.
+
+        Currently unused — segment clicks no longer destroy the middle widget
+        upfront. Format detection in `_on_packets_ready` calls
+        `_swap_to_box_tree_view` / `_swap_to_ts_tabbed_view` which use
+        `QSplitter.replaceWidget` to atomically swap the middle pane.
+
+        Kept as a documented hook in case a future code path needs to
+        explicitly drop all per-segment widgets (e.g. closing the HLS view).
+        """
+        if hasattr(self, '_container_tabs') and self._container_tabs is not None:
+            self._container_tabs.hide()
+            self._container_tabs.setParent(self._widget_stash)
+            self._container_tabs.deleteLater()
+            self._container_tabs = None
+            self._box_tree_view = None
+            self._frame_model = None
+            self._frame_view = None
+        elif hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            self._box_tree_view.hide()
+            self._box_tree_view.setParent(self._widget_stash)
+            self._box_tree_view.deleteLater()
+            self._box_tree_view = None
+        self._swap_from_ts_tabbed_view()
 
     def _on_container_tab_changed(self, index: int):
         """Handle tab switch between Tree View and Frame View."""
@@ -1314,13 +1589,18 @@ class MainWindow(QMainWindow):
 
     def _start_parsing(self, source):
         """Start parsing a data source in background thread."""
-        # Stop any existing worker and close its source
-        if self._worker and self._worker.isRunning():
-            self._worker.stop()
-            self._worker.wait(3000)
-        if self._worker and self._worker.source:
-            self._worker.source.close()
-        self._worker = None
+        # Stop any existing worker and close its source. Drop the reference
+        # BEFORE waiting so queued packets_ready emissions that fire while we
+        # wait will see a mismatch in the slot's worker-identity check and
+        # bail out instead of repopulating the freshly-cleared views.
+        if self._worker is not None:
+            stale = self._worker
+            self._worker = None
+            if stale.isRunning():
+                stale.stop()
+                stale.wait(3000)
+            if stale.source:
+                stale.source.close()
 
         # Stop RTMP if active
         self._stop_rtmp()
@@ -1335,6 +1615,13 @@ class MainWindow(QMainWindow):
         self._detail_panel.clear()
         self._hex_view.clear()
         self._format_detected = False
+        # Defensively clear box tree / frame model state so a new file never
+        # appends on top of a leftover tree (chunk packets carry parser-indexed
+        # mdat_parent_index that only makes sense within a single parse).
+        if hasattr(self, '_box_tree_view') and self._box_tree_view is not None:
+            self._box_tree_view.clear()
+        if hasattr(self, '_frame_model') and self._frame_model is not None:
+            self._frame_model.clear()
 
         # Restore table view if previously in special mode (MP4/TS/WebM)
         self._swap_from_ts_tabbed_view()
@@ -1347,20 +1634,38 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"Parsing: {source.name}...")
         self._info_label.setText("")
 
-        # Start worker thread
-        self._worker = ParseWorker(source, self)
-        self._worker.packets_ready.connect(self._on_packets_ready)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.download_progress.connect(self._on_download_progress)
-        self._worker.parse_finished.connect(self._on_parse_finished)
-        self._worker.error.connect(self._on_parse_error)
-        self._worker.start()
+        # Start worker thread. Bind the worker into each slot via a lambda so
+        # the slot can verify it was invoked by the currently-active worker —
+        # queued emissions from a stopped worker can fire after we've cleared
+        # state for a new file, and Qt.sender() returns None for slots
+        # connected via Python bound methods (PySide6 quirk), so we cannot
+        # rely on sender() for that check.
+        worker = ParseWorker(source, self)
+        self._worker = worker
+        worker.packets_ready.connect(
+            lambda packets, w=worker: self._on_packets_ready(packets, w))
+        worker.progress.connect(
+            lambda cur, tot, w=worker: self._on_progress(cur, tot, w))
+        worker.download_progress.connect(
+            lambda dl, tot, w=worker: self._on_download_progress(dl, tot, w))
+        worker.parse_finished.connect(
+            lambda si, w=worker: self._on_parse_finished(si, w))
+        worker.error.connect(
+            lambda err, w=worker: self._on_parse_error(err, w))
+        worker.start()
 
-    def _on_packets_ready(self, packets):
+    def _on_packets_ready(self, packets, worker=None):
         """Handle batch of parsed packets from worker."""
-        # Early format detection: auto-adapt columns and view based on format
-        # Skip format detection in HLS mode (HLS has its own view layout)
-        if not self._format_detected and packets and self._hls_view is None:
+        # Drop late signals from a worker that's already been replaced. stop()
+        # only flags the worker; queued emissions can still fire after we've
+        # cleared state for a new file. The `worker` arg is bound at connect
+        # time via a lambda, so we know exactly who emitted.
+        if worker is not None and worker is not self._worker:
+            return
+        # Early format detection: auto-adapt columns and view based on format.
+        # Runs even in HLS mode so fMP4/.m4s segments get the box tree and
+        # TS segments keep the packet table.
+        if not self._format_detected and packets:
             self._format_detected = True
             first_pkt = packets[0]
             if first_pkt.script_data and "pid" in first_pkt.script_data:
@@ -1372,7 +1677,34 @@ class MainWindow(QMainWindow):
                 has_frame_view = not first_pkt.script_data.get("riff_layout", False)
                 self._swap_to_box_tree_view(with_frame_view=has_frame_view)
             else:
-                # FLV — use FLV columns
+                # FLV (or unknown) — use FLV columns in the default table.
+                # In HLS mode there may already be a different middle widget
+                # (TS tabs / box tree) from a prior segment; swap it out
+                # atomically so the splitter never transitions through a
+                # 2-pane state.
+                in_hls = (hasattr(self, '_hls_view')
+                          and self._hls_view is not None)
+                target_index = 1 if in_hls else 0
+                cur_at_target = (self._main_splitter.widget(target_index)
+                                 if self._main_splitter.count() > target_index
+                                 else None)
+                if cur_at_target is not self._table_view:
+                    if cur_at_target is None:
+                        # Splitter doesn't yet have a widget at target_index
+                        # (shouldn't happen in HLS mode, but defensively
+                        # insert rather than replace).
+                        self._main_splitter.insertWidget(
+                            target_index, self._table_view)
+                    else:
+                        old = self._main_splitter.replaceWidget(
+                            target_index, self._table_view)
+                        if old is not None:
+                            self._adopt_into_stash(old)
+                if in_hls:
+                    self._main_splitter.setSizes([300, 500, 450])
+                else:
+                    self._main_splitter.setSizes([800, 450])
+                self._table_view.show()
                 self._table_view.set_flv_view()
 
         # Route packets to appropriate view
@@ -1401,14 +1733,18 @@ class MainWindow(QMainWindow):
             count = self._table_model.packet_count
         self._status_label.setText(f"{count:,} tags loaded")
 
-    def _on_progress(self, current: int, total: int):
+    def _on_progress(self, current: int, total: int, worker=None):
         """Update progress bar."""
+        if worker is not None and worker is not self._worker:
+            return
         if total > 0:
             percent = int(current * 100 / total)
             self._progress_bar.setValue(percent)
 
-    def _on_download_progress(self, downloaded: int, total: int):
+    def _on_download_progress(self, downloaded: int, total: int, worker=None):
         """Update status bar with download progress."""
+        if worker is not None and worker is not self._worker:
+            return
         if total > 0:
             percent = int(downloaded * 100 / total)
             mb_down = downloaded / (1024 * 1024)
@@ -1427,8 +1763,10 @@ class MainWindow(QMainWindow):
             if self._worker and isinstance(self._worker.source, StreamingHTTPSource):
                 self._save_as_action.setEnabled(self._worker.source.is_fully_downloaded)
 
-    def _on_parse_finished(self, stream_info: StreamInfo):
+    def _on_parse_finished(self, stream_info: StreamInfo, worker=None):
         """Handle parsing completion."""
+        if worker is not None and worker is not self._worker:
+            return
         self._stream_info = stream_info
         count = self._table_model.packet_count
         logger.info(f"Parse finished: {count} packets, format={stream_info.format_name}, "
@@ -1460,8 +1798,10 @@ class MainWindow(QMainWindow):
         # Update window title
         self.setWindowTitle(f"MediaInsight - {stream_info.source_path}")
 
-    def _on_parse_error(self, error_msg: str):
+    def _on_parse_error(self, error_msg: str, worker=None):
         """Handle parsing error."""
+        if worker is not None and worker is not self._worker:
+            return
         logger.error(f"Parse error: {error_msg}")
         self._progress_bar.hide()
         self._stop_action.setEnabled(False)

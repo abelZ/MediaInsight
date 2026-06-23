@@ -304,16 +304,28 @@ class PlayerPage(QWidget):
         self._vlc_player.audio_set_volume(self._volume_slider.value())
         self._vlc_ready = True
 
-    def load_file(self, file_path: str, source=None, mediainfo_path: Optional[str] = None) -> None:
+    def load_file(self, file_path: str, source=None,
+                  mediainfo_path: Optional[str] = None,
+                  force_mediainfo_reload: bool = False) -> None:
         """Load a media file or URL for playback and info display.
 
         Args:
             file_path: Local path or URL (RTMP/RTMPS/HLS/HTTP all supported by VLC)
             source: Unused (kept for API compat)
             mediainfo_path: Local file path for MediaInfo parsing (temp file for streams)
+            force_mediainfo_reload: Re-parse MediaInfo even when file_path is
+                unchanged. Needed for HLS — the playback URL stays the same
+                across segment clicks but the underlying cached file changes.
         """
         # Skip if already loaded the same file
-        if file_path == self._file_path and self._loaded:
+        same_file = file_path == self._file_path and self._loaded
+        if same_file and not force_mediainfo_reload:
+            return
+
+        # Force-reload path: don't reset VLC playback. Just refresh MediaInfo
+        # so the right pane reflects the most recently cached HLS segment.
+        if same_file and force_mediainfo_reload:
+            self._load_mediainfo_async(mediainfo_path or file_path)
             return
 
         # Stop current playback if any

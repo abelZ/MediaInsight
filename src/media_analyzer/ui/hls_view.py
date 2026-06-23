@@ -28,6 +28,7 @@ class HLSView(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._playlist = None
+        self._info_parts: list = []
         self._setup_ui()
 
     def _setup_ui(self):
@@ -90,6 +91,11 @@ class HLSView(QWidget):
         else:
             info_parts.append("Type: Live")
         info_parts.append(f"Seq: {playlist.media_sequence}")
+        if playlist.init_segment is not None:
+            init_name = playlist.init_segment.uri.split("/")[-1].split("?")[0]
+            # Placeholder marker until main_window calls set_init_status()
+            info_parts.append(f"Init: {init_name} …")
+        self._info_parts = info_parts  # keep so set_init_status() can rebuild
         self._info_label.setText("  |  ".join(info_parts))
 
         # Segment list items
@@ -106,6 +112,20 @@ class HLSView(QWidget):
             self._raw_text.setPlainText(raw_content)
         else:
             self._raw_text.setPlainText("")
+
+    def set_init_status(self, ok: bool) -> None:
+        """Replace the placeholder marker on the Init: ... info-bar chunk.
+
+        Called by main_window once the EXT-X-MAP init segment download finishes.
+        """
+        marker = "✓" if ok else "✗"
+        for i, part in enumerate(self._info_parts):
+            if part.startswith("Init: "):
+                # Strip a trailing placeholder/marker and add the resolved one.
+                name = part[len("Init: "):].rstrip(" ✓✗…").strip()
+                self._info_parts[i] = f"Init: {name} {marker}"
+                break
+        self._info_label.setText("  |  ".join(self._info_parts))
 
     def set_segment_status(self, index: int, status: str) -> None:
         """Update status display for a segment.
