@@ -1877,6 +1877,13 @@ class MP4Parser(BaseParser):
                               sample_list, handler))
                 sample_idx += spc
 
+        # Restrict to chunks that actually live inside this mdat. Without this
+        # filter, fragmented MP4 files (which have many mdat boxes — one per
+        # moof fragment) would re-emit ALL of the track's chunks for EACH
+        # mdat, producing N_mdats × N_chunks packets and freezing the UI.
+        mdat_end = mdat_offset + mdat_size
+        chunks = [c for c in chunks if mdat_offset <= c[0] < mdat_end]
+
         # Sort by file offset
         chunks.sort(key=lambda x: x[0])
 

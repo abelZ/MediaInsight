@@ -695,9 +695,15 @@ class MainWindow(QMainWindow):
             self._rtmp_view.deleteLater()
             self._rtmp_view = None
         self._table_view.show()
-        # Splitter is back to 2 widgets: [table_view, right_splitter]
-        self._main_splitter.setSizes([800, 450])
         self._rtmp_control_bar.hide()
+        # Restore splitter proportions. Use the actual child count — in HLS
+        # mode the splitter already has 3 children (hls, middle, right), so
+        # setSizes([800, 450]) would squash the right pane to 0.
+        n = self._main_splitter.count()
+        if n == 3:
+            self._main_splitter.setSizes([300, 500, 450])
+        else:
+            self._main_splitter.setSizes([800, 450])
 
     # --- HLS ---
 
@@ -1256,7 +1262,13 @@ class MainWindow(QMainWindow):
         from media_analyzer.ui.packet_table.model import TS_PKT_COLUMNS
 
         if hasattr(self, '_ts_tabs') and self._ts_tabs is not None:
-            return  # Already in TS tabbed mode
+            # Already in TS tabbed mode — clear packet data so the new segment
+            # starts fresh (same pattern as _swap_to_box_tree_view's early-return).
+            if self._ts_pkt_model is not None:
+                self._ts_pkt_model.clear()
+            if self._ts_pes_model is not None:
+                self._ts_pes_model.clear()
+            return
 
         in_hls = hasattr(self, '_hls_view') and self._hls_view is not None
         target_index = 1 if in_hls else 0
