@@ -264,6 +264,7 @@ class RTMPWorker(QThread):
     def _emit_handshake_packets(self, hs: HandshakeData):
         """Create and emit RTMP packets for the handshake phase."""
         packets = []
+        now = time.time()
 
         # C0+C1 sent
         c0c1_data = hs.c0 + hs.c1
@@ -275,6 +276,7 @@ class RTMPWorker(QThread):
             offset=self._byte_offset,
             stream_id=0,
             tag_total_size=len(c0c1_data),
+            local_recv_time=now,
             script_data={
                 "rtmp_message_type": "Handshake",
                 "rtmp_message_type_id": 0,
@@ -299,6 +301,7 @@ class RTMPWorker(QThread):
             offset=self._byte_offset,
             stream_id=0,
             tag_total_size=len(s_data),
+            local_recv_time=now,
             script_data={
                 "rtmp_message_type": "Handshake",
                 "rtmp_message_type_id": 0,
@@ -322,6 +325,7 @@ class RTMPWorker(QThread):
             offset=self._byte_offset,
             stream_id=0,
             tag_total_size=len(hs.c2),
+            local_recv_time=now,
             script_data={
                 "rtmp_message_type": "Handshake",
                 "rtmp_message_type_id": 0,
@@ -372,8 +376,20 @@ class RTMPWorker(QThread):
             offset=self._byte_offset,
             stream_id=msg.msg_stream_id,
             tag_total_size=len(msg.raw_bytes) if msg.raw_bytes else len(msg.payload),
+            local_recv_time=time.time(),
             script_data=script_data,
         )
+
+        # Parse codec info from media payloads (same bytes as FLV tag payload)
+        # so the Codec column is populated for RTMP-level packets too.
+        if msg.payload:
+            try:
+                if tag_type == TagType.VIDEO:
+                    self._parse_rtmp_media_codec(pkt, msg.payload, is_video=True)
+                elif tag_type == TagType.AUDIO:
+                    self._parse_rtmp_media_codec(pkt, msg.payload, is_video=False)
+            except Exception:
+                pass  # Gracefully handle malformed payloads
 
         # Store raw bytes for hex view
         self._rtmp_raw_bytes.append(msg.raw_bytes if msg.raw_bytes else msg.payload)
@@ -381,6 +397,22 @@ class RTMPWorker(QThread):
         self._rtmp_index += 1
         self._byte_offset += len(msg.raw_bytes) if msg.raw_bytes else len(msg.payload)
         return pkt
+
+    def _parse_rtmp_media_codec(self, packet: PacketInfo, payload: bytes, is_video: bool):
+        """Parse codec info from an RTMP media payload (same layout as FLV tag payload).
+
+        Reuses the FLVParser so codec identification, frame type, etc. match
+        the FLV Tags view exactly. Only the codec-related fields are needed
+        here; deep NALU parsing is skipped to keep RTMP packet creation fast.
+        """
+        if self._flv_parser is None:
+            from media_analyzer.parsers.flv.parser import FLVParser
+            self._flv_parser = FLVParser()
+
+        if is_video:
+            self._flv_parser._parse_video_tag(packet, payload)
+        else:
+            self._flv_parser._parse_audio_tag(packet, payload)
 
     def _enrich_rtmp_details(self, msg: RTMPMessage, script_data: Dict[str, Any]):
         """Parse type-specific details for RTMP packet display."""
@@ -456,6 +488,7 @@ class RTMPWorker(QThread):
             offset=self._flv_offset,
             stream_id=0,
             tag_total_size=11 + len(msg.payload),  # Simulated FLV tag size
+            local_recv_time=time.time(),
         )
 
         # Use FLVParser to parse tag content (codec, NALUs, etc.)

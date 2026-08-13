@@ -1,5 +1,7 @@
 """Packet table model - QAbstractTableModel for virtual scrolling."""
 
+import datetime
+
 from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
 from PySide6.QtGui import QColor, QFont
 from typing import List, Optional
@@ -10,19 +12,19 @@ from media_analyzer.core.models import PacketInfo, TagType, FrameType, AVCPacket
 # Column definitions: (header_name, attribute_or_property, width_hint)
 # FLV columns (no PID/CC/PUSI — stream format without transport layer)
 FLV_COLUMNS = [
-    ("No.",         "index",            50),
-    ("Type",        "type_label",       60),
-    ("Timestamp",   "timestamp",        80),
-    ("Time",        "_time_human",      80),
-    ("Delta",       "_delta_ms",        50),
-    ("Size",        "data_size",        70),
-    ("Offset",      "offset",           90),
-    ("CTS",         "composition_time", 50),
-    ("DTS",         "dts",              70),
-    ("PTS",         "pts",              70),
-    ("Codec",       "codec_label",      80),
-    ("Frame",       "frame_label",      60),
-    ("Detail",      "detail_label",     250),
+    ("No.",         "index",               50),
+    ("Type",        "type_label",          60),
+    ("Timestamp",   "_timestamp_combined", 170),
+    ("Local Time",  "_local_time_human",   110),
+    ("Delta",       "_delta_ms",           50),
+    ("Size",        "data_size",         70),
+    ("Offset",      "offset",            90),
+    ("CTS",         "composition_time",  50),
+    ("DTS",         "dts",               70),
+    ("PTS",         "pts",               70),
+    ("Codec",       "codec_label",       80),
+    ("Frame",       "frame_label",       60),
+    ("Detail",      "detail_label",      250),
 ]
 
 # Standard columns (fallback, same as FLV)
@@ -30,14 +32,16 @@ COLUMNS = FLV_COLUMNS
 
 # RTMP protocol packet view columns
 RTMP_COLUMNS = [
-    ("No.",       "index",             50),
-    ("Dir",       "_direction",        45),
-    ("Type",      "_rtmp_type",       110),
-    ("CSID",      "_csid",            45),
-    ("MsgSID",    "_msg_stream_id",   60),
-    ("Timestamp", "timestamp",         80),
-    ("Size",      "data_size",         70),
-    ("Detail",    "detail_label",     300),
+    ("No.",        "index",              50),
+    ("Dir",        "_direction",         45),
+    ("Type",       "_rtmp_type",        110),
+    ("CSID",       "_csid",              45),
+    ("MsgSID",     "_msg_stream_id",    60),
+    ("Timestamp",  "_timestamp_combined", 170),
+    ("Local Time", "_local_time_human",  110),
+    ("Codec",      "codec_label",        80),
+    ("Size",       "data_size",          70),
+    ("Detail",     "detail_label",      300),
 ]
 
 # TS packet view columns (with transport layer info)
@@ -234,7 +238,8 @@ class PacketTableModel(QAbstractTableModel):
                            "composition_time", "dts", "pts", "_pid", "_cc",
                            "_csid", "_msg_stream_id", "_delta_ms"):
                 return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            elif col_attr in ("_pusi", "_direction", "_time_human"):
+            elif col_attr in ("_pusi", "_direction", "_time_human", "_local_time_human",
+                              "_timestamp_combined"):
                 return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
             return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         elif role == Qt.ItemDataRole.UserRole:
@@ -365,6 +370,17 @@ class PacketTableModel(QAbstractTableModel):
                 return str(packet.script_data["msg_stream_id"])
             return ""
         # Time/Delta virtual columns
+        elif attr == "_timestamp_combined":
+            # Combined display: [hh:mm:ss.mss] (raw_timestamp)
+            ts = packet.timestamp
+            if ts <= 0:
+                return str(ts)
+            total_sec = ts // 1000
+            ms = ts % 1000
+            secs = total_sec % 60
+            mins = (total_sec // 60) % 60
+            hours = total_sec // 3600
+            return f"[{hours:02d}:{mins:02d}:{secs:02d}.{ms:03d}] ({ts})"
         elif attr == "_time_human":
             ts = packet.timestamp
             if ts <= 0:
@@ -378,6 +394,14 @@ class PacketTableModel(QAbstractTableModel):
             if hours > 0:
                 return f"{hours}:{mins:02d}:{secs:02d}.{ms:03d}"
             return f"{mins:02d}:{secs:02d}.{ms:03d}"
+        elif attr == "_local_time_human":
+            # Local wall-clock time when the packet/tag was received.
+            # Only meaningful for live RTMP sessions (local_recv_time is set).
+            lt = packet.local_recv_time
+            if lt is None:
+                return ""
+            dt = datetime.datetime.fromtimestamp(lt)
+            return dt.strftime("%H:%M:%S.") + f"{int(lt * 1000) % 1000:03d}"
         elif attr == "_delta_ms":
             # Compute delta from previous same-type packet
             return self._get_delta(packet)

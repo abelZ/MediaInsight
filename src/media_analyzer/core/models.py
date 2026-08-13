@@ -218,6 +218,11 @@ class PacketInfo:
     # FLV header info (only for HEADER type pseudo-tag)
     header_info: Optional[FLVHeaderInfo] = None
 
+    # Local wall-clock time when this packet/tag was received (Unix epoch seconds).
+    # Used by RTMP live sessions to show local receive time in hh:mm:ss.mss format.
+    # None for file-based parsing (where the concept does not apply).
+    local_recv_time: Optional[float] = None
+
     @property
     def dts(self) -> int:
         """Decode timestamp."""
